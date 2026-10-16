@@ -499,6 +499,42 @@ class TestBlackrockRawIO(
                 reader._get_nev_rec_times()
             self.assertEqual(memmap.call_args.kwargs["offset"], file_size - 104)
 
+    def test_buffer_description_matches_chunks(self):
+        """
+        Samples read using only the buffer description match get_analogsignal_chunk,
+        for every segment and stream of the non-PTP test files.
+        """
+        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
+        for entity in test_entities:
+            reader = BlackrockRawIO(filename=self.get_local_path(entity))
+            reader.parse_header()
+            for seg_index in range(reader.segment_count(0)):
+                for stream_index, stream in enumerate(reader.header["signal_streams"]):
+                    buffer_id = stream["buffer_id"]
+                    descr = reader.get_analogsignal_buffer_description(
+                        block_index=0, seg_index=seg_index, buffer_id=buffer_id
+                    )
+                    from_dict = np.memmap(
+                        descr["file_path"],
+                        dtype=descr["dtype"],
+                        mode="r",
+                        offset=descr["file_offset"],
+                        shape=descr["shape"],
+                    )
+                    from_neo = reader.get_analogsignal_chunk(
+                        block_index=0, seg_index=seg_index, stream_index=stream_index
+                    )
+                    assert_equal(from_dict, from_neo)
+
+    def test_buffer_description_refused_for_ptp(self):
+        reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0_ptp/20231027-125608-001"))
+        reader.parse_header()
+
+        self.assertFalse(reader.has_buffer_description_api())
+        buffer_id = reader.header["signal_buffers"]["id"][0]
+        with self.assertRaises(ValueError):
+            reader.get_analogsignal_buffer_description(block_index=0, seg_index=0, buffer_id=buffer_id)
+
 
 if __name__ == "__main__":
     unittest.main()

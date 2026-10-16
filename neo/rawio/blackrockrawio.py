@@ -369,6 +369,7 @@ class BlackrockRawIO(BaseRawIO):
         self.sig_sampling_rates = {
             nsx_number: self._nsx_sampling_frequency[nsx_number] for nsx_number in self.nsx_to_load
         }
+        ptp_files_seen = False
         if len(self.nsx_to_load) > 0:
             for nsx_nb in self.nsx_to_load:
                 basic_header = self._nsx_basic_header[nsx_nb]
@@ -381,6 +382,7 @@ class BlackrockRawIO(BaseRawIO):
                 )
                 if is_ptp_variant:
                     data_spec = "3.0-ptp"
+                    ptp_files_seen = True
                 else:
                     data_spec = spec_version
 
@@ -526,6 +528,9 @@ class BlackrockRawIO(BaseRawIO):
             self._nb_segment = len(self._seg_t_starts)
             self._sigs_t_starts = [None] * self._nb_segment
 
+        # If no ptp files were seen, enable the buffer description API.
+        if not ptp_files_seen:
+            self._has_buffer_description_api = True
         # finalize header
         spike_channels = np.array(spike_channels, dtype=_spike_channel_dtype)
         event_channels = np.array(event_channels, dtype=_event_channel_dtype)
@@ -755,6 +760,44 @@ class BlackrockRawIO(BaseRawIO):
         if channel_indexes is None:
             channel_indexes = slice(None)
         return data[i_start:i_stop, channel_indexes]
+
+    def _get_analogsignal_buffer_description(self, block_index: int, seg_index: int, buffer_id: str) -> dict:
+        """Get the description of the analog signal buffer.
+
+        This includes information necessary to memory-map the data, such as
+        file path, data type, shape, and file offset. We currently support only
+        standard (non-PTP) NSX files. PTP streams are never described. Their
+        samples use per-sample timestamps, which this format can't express. The
+        buffer API is disabled when one is loaded.
+
+        Parameters
+        ----------
+        block_index : int
+            Block index.
+        seg_index : int
+            Segment index.
+        buffer_id : str
+            Buffer ID.
+
+        Returns
+        -------
+        buffer_description : dict
+            Dictionary containing the buffer description necessary for memory-mapping the data.
+        """
+        nsx_nb = int(buffer_id)
+        seg = self._nsx_data_header[nsx_nb][seg_index]
+        channels = int(self._nsx_basic_header[nsx_nb]["channel_count"])
+        memmap_kwargs = seg["memmap_kwargs"]
+        samples = memmap_kwargs["num_samples"]
+        buffer_description = {
+            "type": "raw",
+            "file_path": memmap_kwargs["filename"],
+            "dtype": memmap_kwargs["dtype"],
+            "order": "C",
+            "file_offset": memmap_kwargs["offset"],
+            "shape": (samples, channels),
+        }
+        return buffer_description
 
     def _get_blackrock_timestamps(self, block_index, seg_index, i_start, i_stop, stream_index):
         """
