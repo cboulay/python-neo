@@ -1,3 +1,4 @@
+import io
 import mmap
 import numpy as np
 
@@ -53,3 +54,34 @@ def get_memmap_chunk_from_opened_file(fid, num_channels, start, stop, dtype, fil
     )
 
     return arr
+
+
+def read_records_from_opened_file(
+    fid: io.IOBase, dtype: np.typing.DTypeLike, offset: int, count: int = 1
+) -> np.ndarray:
+    """
+    Read a specific number of records from an opened file.
+
+    Parameters
+    ----------
+    fid : file object
+        The opened file object.
+    dtype : data-type
+        The data type of the records to read.
+    offset : int
+        The byte offset in the file to start reading from.
+    count : int, optional
+        The number of records to read. Default is 1.
+
+    Returns
+    -------
+    np.ndarray
+        An array containing the read records.
+    """
+    dtype = np.dtype(dtype)
+    fid.seek(offset, 0)
+    nbytes = count * dtype.itemsize
+    data = fid.read(nbytes)
+    if len(data) != nbytes:
+        raise ValueError(f"Expected {nbytes} bytes at offset {offset}, got {len(data)}")
+    return np.frombuffer(data, dtype=dtype)
