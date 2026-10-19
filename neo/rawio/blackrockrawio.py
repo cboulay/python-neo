@@ -77,6 +77,7 @@ from .baserawio import (
     _spike_channel_dtype,
     _event_channel_dtype,
 )
+from .utils import read_records_from_opened_file
 
 from neo.core import NeoReadWriteError
 
@@ -261,7 +262,7 @@ class BlackrockRawIO(BaseRawIO):
 
             # read nev headers
             nev_filename = f"{self._filenames['nev']}.nev"
-            self._nev_basic_header, self._nev_ext_header = self._read_nev_header(self._nev_spec, nev_filename)
+            self._nev_basic_header, self._nev_ext_header = self._read_nev_header(self._nev_spec)
 
             self.nev_data = self._read_nev_data(self._nev_spec, nev_filename)
             spikes, spike_segment_ids = self.nev_data["Spikes"]
@@ -741,6 +742,13 @@ class BlackrockRawIO(BaseRawIO):
             self._nsx_fids[nsx_nb] = open(filename, "rb")
         return self._nsx_fids[nsx_nb]
 
+    def _get_nev_fid(self):
+        """Open NEV file on demand and cache the file descriptor for reuse."""
+        if not hasattr(self, "_nev_fid"):
+            filename = f"{self._filenames['nev']}.nev"
+            self._nev_fid = open(filename, "rb")
+        return self._nev_fid
+
     def _get_analogsignal_chunk(self, block_index, seg_index, i_start, i_stop, stream_index, channel_indexes):
         stream_id = self.header["signal_streams"][stream_index]["id"]
         nsx_nb = int(stream_id)
@@ -1012,13 +1020,12 @@ class BlackrockRawIO(BaseRawIO):
         """
         Extract file specification from an .nsx file.
         """
-        filename = f"{self._filenames['nsx']}.ns{nsx_nb}"
-
         # Header structure of files specification 2.2 and higher. For files 2.1
         # and lower, the entries ver_major and ver_minor are not supported.
         dt0 = [("file_id", "S8"), ("ver_major", "uint8"), ("ver_minor", "uint8")]
 
-        nsx_file_id = np.fromfile(filename, count=1, dtype=dt0)[0]
+        fid = self._get_nsx_fid(nsx_nb)
+        nsx_file_id = read_records_from_opened_file(fid, dt0, offset=0, count=1)[0]
         if nsx_file_id["file_id"].decode() == "NEURALSG":
             spec = "2.1"
         elif nsx_file_id["file_id"].decode() in ["NEURALCD", "BRSMPGRP"]:
@@ -1032,12 +1039,12 @@ class BlackrockRawIO(BaseRawIO):
         """
         Extract file specification from an .nev file
         """
-        filename = f"{self._filenames['nev']}.nev"
         # Header structure of files specification 2.2 and higher. For files 2.1
         # and lower, the entries ver_major and ver_minor are not supported.
         dt0 = [("file_id", "S8"), ("ver_major", "uint8"), ("ver_minor", "uint8")]
 
-        nev_file_id = np.fromfile(filename, count=1, dtype=dt0)[0]
+        fid = self._get_nev_fid()
+        nev_file_id = read_records_from_opened_file(fid, dt0, offset=0, count=1)[0]
         if nev_file_id["file_id"].decode() in ["NEURALEV", "BREVENTS"]:
             spec = f"{nev_file_id['ver_major']}.{nev_file_id['ver_minor']}"
         else:
@@ -1063,18 +1070,20 @@ class BlackrockRawIO(BaseRawIO):
         nsx_ext_header : numpy memmap
             Extended header information
         """
-        # Construct filename
-        filename = f"{self._filenames['nsx']}.ns{nsx_nb}"
 
         # Get basic header structure for this spec
         basic_header_dtype = NSX_BASIC_HEADER_TYPES[spec]
-        nsx_basic_header = np.fromfile(filename, count=1, dtype=basic_header_dtype)[0]
+
+        fid = self._get_nsx_fid(nsx_nb)
+        nsx_basic_header = read_records_from_opened_file(fid, dtype=basic_header_dtype, count=1, offset=0)[0]
 
         # Get extended header structure for this spec
         ext_header_dtype = NSX_EXT_HEADER_TYPES[spec]
         offset_dt0 = np.dtype(basic_header_dtype).itemsize
         channel_count = int(nsx_basic_header["channel_count"])
-        nsx_ext_header = np.memmap(filename, shape=channel_count, offset=offset_dt0, dtype=ext_header_dtype, mode="r")
+        nsx_ext_header = read_records_from_opened_file(
+            fid, dtype=ext_header_dtype, count=channel_count, offset=offset_dt0
+        )
 
         return nsx_basic_header, nsx_ext_header
 
@@ -1091,14 +1100,14 @@ class BlackrockRawIO(BaseRawIO):
         offset : int
             Offset position in the file
         """
-        filename = f"{self._filenames['nsx']}.ns{nsx_nb}"
 
         # Get data header structure for this spec
         data_header_dtype = NSX_DATA_HEADER_TYPES[spec]
         if data_header_dtype is None:
             return None  # v2.1 has no data headers
 
-        nsx_basic_header = np.memmap(filename, dtype=data_header_dtype, shape=1, offset=offset, mode="r")[0]
+        fid = self._get_nsx_fid(nsx_nb)
+        nsx_basic_header = read_records_from_opened_file(fid, dtype=data_header_dtype, count=1, offset=offset)[0]
 
         return nsx_basic_header
 
@@ -1629,7 +1638,7 @@ class BlackrockRawIO(BaseRawIO):
 
         return ext_header
 
-    def _read_nev_header(self, spec, filename):
+    def _read_nev_header(self, spec):
         """
         Extract nev header information for any specification version.
 
@@ -1637,8 +1646,6 @@ class BlackrockRawIO(BaseRawIO):
         ----------
         spec : str
             The specification version (e.g., "2.1", "2.2", "2.3", "3.0")
-        filename : str
-            The NEV filename to read from
 
         Returns
         -------
@@ -1680,7 +1687,8 @@ class BlackrockRawIO(BaseRawIO):
             ("nb_ext_headers", "uint32"),
         ]
 
-        nev_basic_header = np.fromfile(filename, count=1, dtype=dt0)[0]
+        fid = self._get_nev_fid()
+        nev_basic_header = read_records_from_opened_file(fid, dtype=dt0, count=1, offset=0)[0]
 
         shape = nev_basic_header["nb_ext_headers"]
         offset_dt0 = np.dtype(dt0).itemsize
@@ -1688,7 +1696,7 @@ class BlackrockRawIO(BaseRawIO):
         # This is the common structure of the beginning of extended headers
         dt1 = [("packet_id", "S8"), ("info_field", "S24")]
 
-        raw_ext_header = np.memmap(filename, offset=offset_dt0, dtype=dt1, shape=shape, mode="r")
+        raw_ext_header = read_records_from_opened_file(fid, dtype=dt1, count=shape, offset=offset_dt0)
 
         # Get extended header types for this spec
         header_types = NEV_EXT_HEADER_TYPES_BY_SPEC[spec]
