@@ -558,6 +558,54 @@ class TestBlackrockRawIO(
 
             assert_equal(reader.header, remote.header)
 
+    def test_chunks_from_memory_url_match_local(self):
+        """
+        Test chunks read from a memory:// URL match the same chunks read locally.
+        """
+        import fsspec
+
+        fs = fsspec.filesystem("memory")
+        self.addCleanup(fs.rm, "/blackrock", recursive=True)
+        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
+        for entity in test_entities:
+            local_base = self.get_local_path(entity)
+            for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
+                local_file = Path(local_base + ext)
+                if local_file.exists():
+                    fs.pipe(f"{entity}{ext}", local_file.read_bytes())
+            reader = BlackrockRawIO(filename=local_base)
+            reader.parse_header()
+            remote = BlackrockRawIO(filename=f"memory:///{entity}")
+            remote.parse_header()
+
+            for block_index in range(reader.header["nb_block"]):
+                for seg_index in range(reader.header["nb_segment"][block_index]):
+                    for stream_index, _ in enumerate(reader.header["signal_streams"]["id"]):
+                        assert_equal(
+                            remote.get_analogsignal_chunk(
+                                block_index=block_index, seg_index=seg_index, stream_index=stream_index
+                            ),
+                            reader.get_analogsignal_chunk(
+                                block_index=block_index, seg_index=seg_index, stream_index=stream_index
+                            ),
+                        )
+                        assert_equal(
+                            remote.get_analogsignal_chunk(
+                                block_index=block_index,
+                                seg_index=seg_index,
+                                stream_index=stream_index,
+                                i_start=1000,
+                                i_stop=1100,
+                            ),
+                            reader.get_analogsignal_chunk(
+                                block_index=block_index,
+                                seg_index=seg_index,
+                                stream_index=stream_index,
+                                i_start=1000,
+                                i_stop=1100,
+                            ),
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

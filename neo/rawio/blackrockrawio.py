@@ -780,18 +780,78 @@ class BlackrockRawIO(BaseRawIO):
         fid = self._get_nsx_fid(nsx_nb)
         memmap_kwargs = seg["memmap_kwargs"]
         channels = int(self._nsx_basic_header[nsx_nb]["channel_count"])
-        data = self._create_mmap_view(
-            fid=fid,
-            dtype=memmap_kwargs["dtype"],
-            offset=memmap_kwargs["offset"],
-            num_samples=memmap_kwargs["num_samples"],
-            num_channels=memmap_kwargs.get("num_channels", channels),
-            packet_size=memmap_kwargs.get("packet_size"),
-            item_offset=memmap_kwargs.get("item_offset", 0),
-        )
+        if self._fs is None:
+            data = self._create_mmap_view(
+                fid=fid,
+                dtype=memmap_kwargs["dtype"],
+                offset=memmap_kwargs["offset"],
+                num_samples=memmap_kwargs["num_samples"],
+                num_channels=memmap_kwargs.get("num_channels", channels),
+                packet_size=memmap_kwargs.get("packet_size"),
+                item_offset=memmap_kwargs.get("item_offset", 0),
+            )[i_start:i_stop]
+        else:
+            data = self._read_rows(
+                fid=fid,
+                memmap_kwargs=memmap_kwargs,
+                num_channels=memmap_kwargs.get("num_channels", channels),
+                i_start=i_start,
+                i_stop=i_stop,
+            )
         if channel_indexes is None:
             channel_indexes = slice(None)
-        return data[i_start:i_stop, channel_indexes]
+        return data[:, channel_indexes]
+
+    def _read_rows(
+        self,
+        fid: io.IOBase,
+        memmap_kwargs: dict,
+        num_channels: int,
+        i_start: int | None,
+        i_stop: int | None,
+    ) -> np.ndarray:
+        """
+        Read a chunk of analog signal data from the file. Standard files
+        have no `packet_size`, so a row is `num_channels x itemsize` bytes.
+
+        Parameters
+        ----------
+        fid : io.IOBase
+            File descriptor of the NSX file.
+        memmap_kwargs : dict
+            Dictionary containing memory-mapping information.
+        num_channels : int
+            Number of channels in the data.
+        i_start : int | None, optional
+            Starting row index, by default None.
+        i_stop : int | None, optional
+            Ending row index, by default None.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape (n_rows, num_channels) containing the requested data.
+        """
+
+        dtype = np.dtype(memmap_kwargs["dtype"])
+        itemsize = dtype.itemsize
+        packet_size = memmap_kwargs.get("packet_size") or num_channels * itemsize
+        item_offset = memmap_kwargs.get("item_offset", 0)
+        if i_start is None:
+            i_start = 0
+        if i_stop is None:
+            i_stop = memmap_kwargs["num_samples"]
+        first = memmap_kwargs["offset"] + i_start * packet_size + item_offset
+        n_rows = i_stop - i_start
+        if n_rows > 0:
+            length = (n_rows - 1) * packet_size + num_channels * itemsize
+        else:
+            length = 0
+        fid.seek(first)
+        data = fid.read(length)
+        if len(data) != length:
+            raise ValueError(f"Expected {length} bytes at offset {first}, got {len(data)}")
+        return np.ndarray(shape=(n_rows, num_channels), dtype=dtype, buffer=data, strides=(packet_size, itemsize))
 
     def _get_analogsignal_buffer_description(self, block_index: int, seg_index: int, buffer_id: str) -> dict:
         """Get the description of the analog signal buffer.
