@@ -1929,38 +1929,60 @@ class BlackrockRawIO(BaseRawIO):
 
     def _nev_piece_segment_ids(self, raw, masks, spec, start, state):
         """
-        Segment ids for one piece of NEV packets, the same as _get_event_segment_ids gives
-        on the whole file.
+        Segment ids for one piece of NEV packets (the whole file is one piece).
 
-        A segment starts at a reset comment or where a handled packet's timestamp is lower
-        than the previous handled packet's. Both are known when the packet is reached, so
-        pieces can be processed in order; `state` carries the previous timestamp and the
-        number of boundaries so far from one piece to the next.
+        A segment starts at a reset comment, or at a packet whose timestamp is lower than the
+        last packet of the same type since the segment began: a clock reset sends every packet
+        type's clock back. Packets of different types are not compared: the format does not
+        order them, and comments can be stamped a few ms after the spikes written after them,
+        which compared across types looked like a reset each time. `state` carries the last
+        timestamp and position of each type, and the boundaries so far, from piece to piece.
         """
         n = len(raw)
         if spec in ["2.1", "2.2"]:
             # No pause or reset mechanism present for file version 2.1 and 2.2
             return np.zeros(n, dtype=int)
         reset_pos = np.flatnonzero(self._get_reset_event_mask(raw, masks, spec))
-        handled_pos = np.flatnonzero(np.any([mask for mask in masks.values()], axis=0))
-        ts = raw["timestamp"][handled_pos]
-        if len(ts):
-            previous = ts[:-1] if state["last_handled"] is None else np.concatenate(([state["last_handled"]], ts[:-1]))
-            current_pos = handled_pos[1:] if state["last_handled"] is None else handled_pos
-            current_ts = ts[1:] if state["last_handled"] is None else ts
-            jump_pos = current_pos[current_ts < previous]
-            state["last_handled"] = ts[-1]
-        else:
-            jump_pos = np.empty(0, dtype=np.int64)
-        state["undocumented"].extend((np.setdiff1d(jump_pos, reset_pos) + start).tolist())
-        boundaries = np.union1d(reset_pos, jump_pos)
-        ids = state["boundaries"] + np.searchsorted(boundaries, np.arange(n), side="right")
-        state["boundaries"] += len(boundaries)
+
+        # Candidate jumps per packet type: a packet earlier than the previous one of its type.
+        # Each is kept with the position of the packet it was compared with.
+        candidates = []  # (position, position compared with, is a reset comment)
+        for data_type, mask in masks.items():
+            pos = np.flatnonzero(mask)
+            if len(pos) == 0:
+                continue
+            ts = raw["timestamp"][pos]
+            if data_type in state["last"]:
+                last_ts, last_pos = state["last"][data_type]
+                prev_ts = np.concatenate(([last_ts], ts[:-1]))
+                prev_pos = np.concatenate(([last_pos], pos[:-1] + start))
+            else:
+                prev_ts, prev_pos, ts, pos = ts[:-1], pos[:-1] + start, ts[1:], pos[1:]
+            jumps = np.flatnonzero(ts < prev_ts)
+            candidates.extend(zip((pos[jumps] + start).tolist(), prev_pos[jumps].tolist(), [False] * len(jumps)))
+            state["last"][data_type] = (raw["timestamp"][mask][-1], int(np.flatnonzero(mask)[-1]) + start)
+        candidates.extend((int(r) + start, -1, True) for r in reset_pos)
+
+        # Accept in file order. A jump counts only if the packet it was compared with is in the
+        # current segment, so one reset is one boundary however many packet types it sends back.
+        reset_at = {int(r) + start for r in reset_pos}
+        boundaries = []
+        for position, compared_with, is_reset in sorted(candidates):
+            if boundaries and position == boundaries[-1]:
+                continue  # a reset comment and a jump at the same packet are one boundary
+            if is_reset or compared_with >= state["segment_start"]:
+                boundaries.append(position)
+                state["segment_start"] = position
+                if position not in reset_at:
+                    state["undocumented"].append(position)
+        local = np.array(sorted(boundaries), dtype=np.int64) - start
+        ids = state["boundaries"] + np.searchsorted(local, np.arange(n), side="right")
+        state["boundaries"] += len(local)
         return ids
 
     @staticmethod
     def _new_nev_segment_state():
-        return {"last_handled": None, "boundaries": 0, "undocumented": []}
+        return {"last": {}, "segment_start": -1, "boundaries": 0, "undocumented": []}
 
     def _scan_nev_data(self, spec):
         """
@@ -2151,48 +2173,16 @@ class BlackrockRawIO(BaseRawIO):
             return np.zeros(len(raw_event_data), dtype=int)
 
         elif spec in ["2.3", "3.0"]:
-            reset_ev_mask = self._get_reset_event_mask(raw_event_data, masks, spec)
-            reset_ev_ids = np.where(reset_ev_mask)[0]
-
-            # consistency check for monotone increasing time stamps
-            # - Use logical comparator (instead of np.diff) to avoid unsigned dtype issues.
-            # - Only consider handled/known event types.
-            # - Compare only packets of the same type: the file does not order packets of different
-            #   types (e.g. a comment is stamped when the user starts typing but written when they
-            #   finish, so it can be later than the spikes written after it).
-            # jumps maps the position of a packet earlier than the previous packet of its type to the
-            # position of that previous packet, in the full set of events (incl. unhandled).
-            jumps = {}
-            for mask in masks.values():
-                ids = np.flatnonzero(mask)
-                ts = raw_event_data["timestamp"][ids]
-                earlier = np.flatnonzero(ts[1:] < ts[:-1])
-                jumps.update(zip(ids[earlier + 1].tolist(), ids[earlier].tolist()))
-
-            # A reset sends the clock of every packet type back, so each type jumps at its first packet
-            # after it. Count a jump only if the packet it is compared with is in the current segment,
-            # so that one reset is one boundary.
-            reset_set = set(reset_ev_ids.tolist())
-            boundaries = []
-            segment_start = 0
-            for position in sorted(reset_set | jumps.keys()):
-                if position in reset_set or jumps[position] >= segment_start:
-                    boundaries.append(position)
-                    segment_start = position
-            additional_ids = np.array([b for b in boundaries if b not in reset_set])
-            if len(additional_ids):
-                # additional resets occurred without a reset event being stored
+            state = self._new_nev_segment_state()
+            event_segment_ids = self._nev_piece_segment_ids(raw_event_data, masks, spec, 0, state)
+            if state["undocumented"]:
+                additional_ids = np.array(state["undocumented"])
                 warnings.warn(
                     f"Detected {len(additional_ids)} undocumented segments within "
                     f"nev data after timestamps {additional_ids}."
                     ""
                 )
-
-            event_segment_ids = np.zeros(len(raw_event_data), dtype=int)
-            event_segment_ids[boundaries] = 1
-            event_segment_ids = np.cumsum(event_segment_ids)
-
-            self._nb_segment_nev = len(boundaries) + 1
+            self._nb_segment_nev = state["boundaries"] + 1
             return event_segment_ids
 
         else:
