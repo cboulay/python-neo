@@ -183,6 +183,10 @@ class BlackrockRawIO(BaseRawIO):
         BaseRawIO.__init__(self)
 
         self.gap_tolerance_ms = gap_tolerance_ms
+        # Packets read at once when a remote NEV is scanned in pieces (about 27 MB at 104-byte packets).
+        self._nev_packets_per_piece = 1 << 18
+        # Summary of a NEV's spikes when it was scanned in pieces instead of read into memory.
+        self._nev_spikes = None
 
         self.filename = str(filename)
         if "://" in self.filename:
@@ -293,7 +297,6 @@ class BlackrockRawIO(BaseRawIO):
             self._nev_basic_header, self._nev_ext_header = self._read_nev_header(self._nev_spec)
 
             self.nev_data = self._read_nev_data(self._nev_spec, nev_filename)
-            spikes, spike_segment_ids = self.nev_data["Spikes"]
 
             # scan all channel to get number of Unit
             spike_channels = []
@@ -305,12 +308,9 @@ class BlackrockRawIO(BaseRawIO):
                 # won't overflow
                 channel_id = int(self._nev_ext_header[b"NEUEVWAV"]["electrode_id"][i])
 
-                chan_mask = spikes["packet_id"] == channel_id
-                chan_spikes = spikes[chan_mask]
-
                 # all `unit_class_nb` is uint8. Also will have issues with overflow
                 # cast this to python int
-                all_unit_id = np.unique(chan_spikes["unit_class_nb"])
+                all_unit_id = self._nev_unit_ids(channel_id)
                 for u, unit_id in enumerate(all_unit_id):
                     unit_id = int(unit_id)
                     self.internal_unit_ids.append((channel_id, unit_id))
@@ -514,6 +514,9 @@ class BlackrockRawIO(BaseRawIO):
                             t = data[segment_mask][-1]["timestamp"] / self._nev_basic_header["timestamp_resolution"]
 
                             max_nev_time = max(max_nev_time, t)
+                    if self._nev_spikes is not None and data_bl in self._spike_times_by_segment():
+                        t = self._spike_times_by_segment()[data_bl][1] / self._nev_basic_header["timestamp_resolution"]
+                        max_nev_time = max(max_nev_time, t)
                     if max_nev_time > t_stop:
                         t_stop = max_nev_time
                     min_nev_time = max_nev_time
@@ -522,6 +525,9 @@ class BlackrockRawIO(BaseRawIO):
                         if data[segment_mask].size > 0:
                             t = data[segment_mask][0]["timestamp"] / self._nev_basic_header["timestamp_resolution"]
                             min_nev_time = min(min_nev_time, t)
+                    if self._nev_spikes is not None and data_bl in self._spike_times_by_segment():
+                        t = self._spike_times_by_segment()[data_bl][0] / self._nev_basic_header["timestamp_resolution"]
+                        min_nev_time = min(min_nev_time, t)
                     if min_nev_time < t_start:
                         t_start = min_nev_time
                 self._seg_t_starts.append(t_start)
@@ -542,6 +548,12 @@ class BlackrockRawIO(BaseRawIO):
                             max_nev_times[i] = max(curr_data["timestamp"])
                         if min(curr_data["timestamp"]) <= min_nev_times.get(i, max_nev_times[i]):
                             min_nev_times[i] = min(curr_data["timestamp"])
+            if self._nev_spikes is not None:
+                for i, (_first, _last, lowest, highest) in self._spike_times_by_segment().items():
+                    if highest >= max_nev_times.get(i, 0):
+                        max_nev_times[i] = highest
+                    if lowest <= min_nev_times.get(i, max_nev_times[i]):
+                        min_nev_times[i] = lowest
 
             # Calculate t_start and t_stop for each segment in seconds
             resolution = self._nev_basic_header["timestamp_resolution"]
@@ -973,7 +985,7 @@ class BlackrockRawIO(BaseRawIO):
     def _spike_count(self, block_index, seg_index, unit_index):
         channel_id, unit_id = self.internal_unit_ids[unit_index]
 
-        all_spikes, event_segment_ids = self.nev_data["Spikes"]
+        all_spikes, event_segment_ids = self._spike_records(channel_id, unit_id)
         # Selected by segment id, as _get_spike_timestamps does, so the count always equals
         # the number of timestamps it returns.
         mask = (
@@ -986,7 +998,7 @@ class BlackrockRawIO(BaseRawIO):
     def _get_spike_timestamps(self, block_index, seg_index, unit_index, t_start, t_stop):
         channel_id, unit_id = self.internal_unit_ids[unit_index]
 
-        all_spikes, event_segment_ids = self.nev_data["Spikes"]
+        all_spikes, event_segment_ids = self._spike_records(channel_id, unit_id)
 
         # select by channel_id and unit_id
         mask = (
@@ -1032,7 +1044,7 @@ class BlackrockRawIO(BaseRawIO):
 
     def _get_spike_raw_waveforms(self, block_index, seg_index, unit_index, t_start, t_stop):
         channel_id, unit_id = self.internal_unit_ids[unit_index]
-        all_spikes, event_segment_ids = self.nev_data["Spikes"]
+        all_spikes, event_segment_ids = self._spike_records(channel_id, unit_id)
 
         mask = (
             (all_spikes["packet_id"] == channel_id)
@@ -1040,19 +1052,7 @@ class BlackrockRawIO(BaseRawIO):
             & (event_segment_ids == seg_index)
         )
         unit_spikes = all_spikes[mask]
-
-        wf_dtype = self._nev_params("waveform_dtypes")[channel_id]
-        wf_size = self._nev_params("waveform_size")[channel_id]
-        wf_byte_size = np.dtype(wf_dtype).itemsize * wf_size
-
-        dt1 = [
-            ("extra", "S{}".format(unit_spikes["waveform"].dtype.itemsize - wf_byte_size)),
-            ("ch_waveform", "S{}".format(wf_byte_size)),
-        ]
-
-        waveforms = unit_spikes["waveform"].view(dt1)["ch_waveform"].flatten().view(wf_dtype)
-
-        waveforms = waveforms.reshape(int(unit_spikes.size), 1, int(wf_size))
+        waveforms = self._spike_waveforms(unit_spikes, channel_id)
 
         timestamp = unit_spikes["timestamp"]
         sl = self._get_timestamp_slice(timestamp, seg_index, t_start, t_stop)
@@ -1855,9 +1855,11 @@ class BlackrockRawIO(BaseRawIO):
         data_packages_in_bytes = self._get_file_size(filename) - header_size
         n_packets = int(data_packages_in_bytes / packet_size_bytes)
 
-        # this is the one place a branch will live outside the file access method since it's about how to read (map vs copy) and not where the file is located
-        # loca files stay memory mapped, so the NEV isn't loaded into memory and remote files can't be memory-mapped, so their packets are copied
+        self._nev_layout = {"dtype": dt0, "header_size": header_size, "n_packets": n_packets}
+        self._nev_spikes = None
+
         if self._fs is None:
+            # Local files stay memory-mapped, so the raw packets are not copied into memory.
             raw_data = np.memmap(
                 filename,
                 offset=header_size,
@@ -1865,28 +1867,19 @@ class BlackrockRawIO(BaseRawIO):
                 shape=(n_packets,),
                 mode="r",
             )
-        else:
+        elif spec == "2.3":
+            # 2.3 moves spikes between segments by each spike's own timestamp
+            # (_match_nsx_and_nev_segment_ids), which needs every packet at once.
             raw_data = read_records_from_opened_file(
                 self._get_nev_fid(), dtype=dt0, offset=header_size, count=n_packets
             )
+        else:
+            # A remote NEV can be far larger than memory: scan it in pieces and keep
+            # everything except the spike packets, which are summarized.
+            return self._scan_nev_data(spec)
 
-        # Get packet identifiers and types directly from spec-based dictionaries
         packet_identifiers = NEV_PACKET_IDENTIFIERS_BY_SPEC[spec]
-        data_types = NEV_PACKET_DATA_TYPES_BY_SPEC[spec]
-
-        # Apply masks and create type definitions
-        masks = {}
-        types = {}
-        for data_type, packet_id_spec in packet_identifiers.items():
-            if isinstance(packet_id_spec, tuple):
-                # Range check (min, max)
-                min_val, max_val = packet_id_spec
-                masks[data_type] = (min_val <= raw_data["packet_id"]) & (raw_data["packet_id"] <= max_val)
-            else:
-                # Equality check
-                masks[data_type] = raw_data["packet_id"] == packet_id_spec
-
-            types[data_type] = data_types[data_type](packet_size_bytes)
+        masks, types = self._nev_masks_and_types(raw_data, spec)
 
         event_segment_ids = self._get_event_segment_ids(raw_data, masks, spec)
 
@@ -1901,6 +1894,238 @@ class BlackrockRawIO(BaseRawIO):
             data[data_type] = (raw_data.view(types[data_type])[mask], event_segment_ids[mask])
 
         return data
+
+    def _nev_masks_and_types(self, raw_data, spec):
+        """Per packet type: a mask of which packets are that type, and the type's dtype."""
+        packet_size_bytes = self._nev_basic_header["bytes_in_data_packets"]
+        data_types = NEV_PACKET_DATA_TYPES_BY_SPEC[spec]
+        masks = {}
+        types = {}
+        for data_type, packet_id_spec in NEV_PACKET_IDENTIFIERS_BY_SPEC[spec].items():
+            if isinstance(packet_id_spec, tuple):
+                # Range check (min, max)
+                min_val, max_val = packet_id_spec
+                masks[data_type] = (min_val <= raw_data["packet_id"]) & (raw_data["packet_id"] <= max_val)
+            else:
+                # Equality check
+                masks[data_type] = raw_data["packet_id"] == packet_id_spec
+            types[data_type] = data_types[data_type](packet_size_bytes)
+        return masks, types
+
+    def _iter_nev_pieces(self):
+        """Yield (index of the first packet, packets) over the whole NEV, a piece at a time."""
+        layout = self._nev_layout
+        packet_size = np.dtype(layout["dtype"]).itemsize
+        step = self._nev_packets_per_piece
+        for start in range(0, layout["n_packets"], step):
+            count = min(step, layout["n_packets"] - start)
+            raw = read_records_from_opened_file(
+                self._get_nev_fid(),
+                dtype=layout["dtype"],
+                offset=layout["header_size"] + start * packet_size,
+                count=count,
+            )
+            yield start, raw
+
+    def _nev_piece_segment_ids(self, raw, masks, spec, start, state):
+        """
+        Segment ids for one piece of NEV packets, the same as _get_event_segment_ids gives
+        on the whole file.
+
+        A segment starts at a reset comment or where a handled packet's timestamp is lower
+        than the previous handled packet's. Both are known when the packet is reached, so
+        pieces can be processed in order; `state` carries the previous timestamp and the
+        number of boundaries so far from one piece to the next.
+        """
+        n = len(raw)
+        if spec in ["2.1", "2.2"]:
+            # No pause or reset mechanism present for file version 2.1 and 2.2
+            return np.zeros(n, dtype=int)
+        reset_pos = np.flatnonzero(self._get_reset_event_mask(raw, masks, spec))
+        handled_pos = np.flatnonzero(np.any([mask for mask in masks.values()], axis=0))
+        ts = raw["timestamp"][handled_pos]
+        if len(ts):
+            previous = ts[:-1] if state["last_handled"] is None else np.concatenate(([state["last_handled"]], ts[:-1]))
+            current_pos = handled_pos[1:] if state["last_handled"] is None else handled_pos
+            current_ts = ts[1:] if state["last_handled"] is None else ts
+            jump_pos = current_pos[current_ts < previous]
+            state["last_handled"] = ts[-1]
+        else:
+            jump_pos = np.empty(0, dtype=np.int64)
+        state["undocumented"].extend((np.setdiff1d(jump_pos, reset_pos) + start).tolist())
+        boundaries = np.union1d(reset_pos, jump_pos)
+        ids = state["boundaries"] + np.searchsorted(boundaries, np.arange(n), side="right")
+        state["boundaries"] += len(boundaries)
+        return ids
+
+    @staticmethod
+    def _new_nev_segment_state():
+        return {"last_handled": None, "boundaries": 0, "undocumented": []}
+
+    def _scan_nev_data(self, spec):
+        """
+        Read a NEV in pieces. Returns the same dict as _read_nev_data, without "Spikes":
+        spike packets are most of a NEV, so only a summary of them is kept, in
+        self._nev_spikes (units per channel, and per segment the first, last, lowest and
+        highest spike timestamp). Spikes themselves are read again on demand.
+        """
+        packet_identifiers = NEV_PACKET_IDENTIFIERS_BY_SPEC[spec]
+        kept = {data_type: ([], []) for data_type in packet_identifiers if data_type != "Spikes"}
+        kept_types = None
+        units = {}
+        seg_times = {}  # raw segment id -> [first, last, lowest, highest]
+        state = self._new_nev_segment_state()
+        for start, raw in self._iter_nev_pieces():
+            masks, types = self._nev_masks_and_types(raw, spec)
+            kept_types = types
+            ids = self._nev_piece_segment_ids(raw, masks, spec, start, state)
+            for data_type, (records, record_ids) in kept.items():
+                records.append(raw.view(types[data_type])[masks[data_type]])
+                record_ids.append(ids[masks[data_type]])
+            spikes = raw.view(types["Spikes"])[masks["Spikes"]]
+            spike_ids = ids[masks["Spikes"]]
+            if len(spikes) == 0:
+                continue
+            for channel_id, unit_id in np.unique(
+                np.stack((spikes["packet_id"], spikes["unit_class_nb"]), axis=1), axis=0
+            ):
+                units.setdefault(int(channel_id), set()).add(int(unit_id))
+            for seg in np.unique(spike_ids):
+                seg_ts = spikes["timestamp"][spike_ids == seg]
+                times = seg_times.setdefault(int(seg), [seg_ts[0], seg_ts[-1], seg_ts.min(), seg_ts.max()])
+                times[1] = seg_ts[-1]
+                times[2] = min(times[2], seg_ts.min())
+                times[3] = max(times[3], seg_ts.max())
+
+        if state["undocumented"]:
+            additional_ids = np.array(state["undocumented"])
+            warnings.warn(
+                f"Detected {len(additional_ids)} undocumented segments within "
+                f"nev data after timestamps {additional_ids}."
+                ""
+            )
+        if spec in ["2.3", "3.0"]:
+            self._nb_segment_nev = state["boundaries"] + 1
+
+        if kept_types is None:  # a NEV with no packets
+            _, kept_types = self._nev_masks_and_types(np.empty(0, dtype=self._nev_layout["dtype"]), spec)
+        data = {}
+        for data_type, (records, record_ids) in kept.items():
+            data[data_type] = (
+                np.concatenate(records) if records else np.empty(0, dtype=kept_types[data_type]),
+                np.concatenate(record_ids) if record_ids else np.empty(0, dtype=int),
+            )
+        self._nev_spikes = {"units": units, "seg_times": seg_times, "deleted_segments": [], "types": kept_types}
+        return data
+
+    def _spike_segment_ids(self, raw_ids):
+        """Segment ids of scanned spikes after the same removals _delete_empty_segments made to the others."""
+        ids = np.array(raw_ids, copy=True)
+        for seg_index in self._nev_spikes["deleted_segments"]:
+            ids[ids > seg_index] -= 1
+        return ids
+
+    def _spike_times_by_segment(self):
+        """For a scanned NEV: per segment, the first, last, lowest and highest spike timestamp."""
+        merged = {}
+        for raw_seg in sorted(self._nev_spikes["seg_times"]):
+            first, last, lowest, highest = self._nev_spikes["seg_times"][raw_seg]
+            seg = int(self._spike_segment_ids([raw_seg])[0])
+            if seg in merged:
+                times = merged[seg]
+                merged[seg] = [times[0], last, min(times[2], lowest), max(times[3], highest)]
+            else:
+                merged[seg] = [first, last, lowest, highest]
+        return merged
+
+    def _spike_records(self, channel_id, unit_id):
+        """
+        (spike records, segment ids) to select one unit's spikes from. In memory, every spike;
+        for a scanned NEV, this unit's spikes, read with one more pass over the file.
+        """
+        if self._nev_spikes is None:
+            return self.nev_data["Spikes"]
+        records, record_ids = [], []
+        state = self._new_nev_segment_state()
+        for start, raw in self._iter_nev_pieces():
+            masks, types = self._nev_masks_and_types(raw, self._nev_spec)
+            ids = self._nev_piece_segment_ids(raw, masks, self._nev_spec, start, state)
+            spikes = raw.view(types["Spikes"])
+            mask = masks["Spikes"] & (spikes["packet_id"] == channel_id) & (spikes["unit_class_nb"] == unit_id)
+            records.append(spikes[mask])
+            record_ids.append(ids[mask])
+        spike_type = self._nev_spikes["types"]["Spikes"]
+        all_spikes = np.concatenate(records) if records else np.empty(0, dtype=spike_type)
+        segment_ids = np.concatenate(record_ids) if record_ids else np.empty(0, dtype=int)
+        return all_spikes, self._spike_segment_ids(segment_ids)
+
+    def _nev_unit_ids(self, channel_id):
+        """Sorted unit ids that have spikes on one channel."""
+        if self._nev_spikes is not None:
+            return np.array(sorted(self._nev_spikes["units"].get(channel_id, ())), dtype=np.uint8)
+        spikes = self.nev_data["Spikes"][0]
+        return np.unique(spikes[spikes["packet_id"] == channel_id]["unit_class_nb"])
+
+    def _spike_waveforms(self, unit_spikes, channel_id):
+        """Raw waveforms (n, 1, samples) of one channel's spike records."""
+        wf_dtype = self._nev_params("waveform_dtypes")[channel_id]
+        wf_size = self._nev_params("waveform_size")[channel_id]
+        wf_byte_size = np.dtype(wf_dtype).itemsize * wf_size
+
+        dt1 = [
+            ("extra", "S{}".format(unit_spikes["waveform"].dtype.itemsize - wf_byte_size)),
+            ("ch_waveform", "S{}".format(wf_byte_size)),
+        ]
+
+        waveforms = unit_spikes["waveform"].view(dt1)["ch_waveform"].flatten().view(wf_dtype)
+        return waveforms.reshape(int(unit_spikes.size), 1, int(wf_size))
+
+    def iter_spikes(self, seg_index=0, packets_per_piece=None):
+        """
+        Yield one segment's spikes a piece at a time, for every unit, reading the NEV once.
+
+        neo's per-unit methods (get_spike_timestamps, get_spike_raw_waveforms) each have to
+        look at every packet, because a unit's spikes are spread through the whole file; on a
+        large remote NEV, calling them for every unit reads the file once per unit. This reads
+        it once in total, and memory stays at about one piece.
+
+        Each item is a dict {unit_index: (timestamps, waveforms)}: raw timestamps and raw
+        waveforms shaped (n, 1, samples), as the per-unit methods return them. Concatenated
+        over all items, each unit's arrays equal what those methods return for this segment.
+        """
+        step = packets_per_piece or self._nev_packets_per_piece
+        unit_index_of = {pair: i for i, pair in enumerate(self.internal_unit_ids)}
+
+        def pieces():
+            if self._nev_spikes is None:
+                spikes, ids = self.nev_data["Spikes"]
+                for start in range(0, len(spikes), step):
+                    yield spikes[start : start + step], ids[start : start + step]
+                return
+            state = self._new_nev_segment_state()
+            saved, self._nev_packets_per_piece = self._nev_packets_per_piece, step
+            try:
+                for start, raw in self._iter_nev_pieces():
+                    masks, types = self._nev_masks_and_types(raw, self._nev_spec)
+                    ids = self._nev_piece_segment_ids(raw, masks, self._nev_spec, start, state)
+                    yield raw.view(types["Spikes"])[masks["Spikes"]], self._spike_segment_ids(ids[masks["Spikes"]])
+            finally:
+                self._nev_packets_per_piece = saved
+
+        for spikes, ids in pieces():
+            spikes = spikes[ids == seg_index]
+            if len(spikes) == 0:
+                continue
+            piece = {}
+            keys = np.stack((spikes["packet_id"], spikes["unit_class_nb"]), axis=1)
+            for channel_id, unit_id in np.unique(keys, axis=0):
+                unit_index = unit_index_of.get((int(channel_id), int(unit_id)))
+                if unit_index is None:
+                    continue
+                unit_spikes = spikes[(keys[:, 0] == channel_id) & (keys[:, 1] == unit_id)]
+                piece[unit_index] = (unit_spikes["timestamp"], self._spike_waveforms(unit_spikes, int(channel_id)))
+            if piece:
+                yield piece
 
     def _get_reset_event_mask(self, raw_event_data, masks, spec):
         """
@@ -2342,6 +2567,8 @@ class BlackrockRawIO(BaseRawIO):
             if self._avail_files["nev"]:
                 for _data, ev_ids in self.nev_data.values():
                     ev_ids[ev_ids > seg_index] -= 1
+                if self._nev_spikes is not None:
+                    self._nev_spikes["deleted_segments"].append(seg_index)
 
             self._nb_segment -= 1
 

@@ -541,6 +541,8 @@ class TestBlackrockRawIO(
         """
 
     def _open_local_and_from_memory(self, entity, **kwargs):
+
+    def _open_local_and_from_memory(self, entity, nev_packets_per_piece=None, **kwargs):
         """Open a recording locally and, after copying its files into fsspec's memory filesystem, by memory:// URL."""
         import fsspec
 
@@ -554,8 +556,54 @@ class TestBlackrockRawIO(
         local = BlackrockRawIO(filename=local_base, **kwargs)
         local.parse_header()
         remote = BlackrockRawIO(filename=f"memory:///{entity}", **kwargs)
+        if nev_packets_per_piece:
+            remote._nev_packets_per_piece = nev_packets_per_piece
         remote.parse_header()
+        # Tiny pieces test the open-time scan across piece boundaries; the per-unit reads after
+        # it use the same code, so larger pieces keep the tests fast.
+        remote._nev_packets_per_piece = 4096
         return local, remote
+
+    def _assert_same_spikes_and_events(self, local, remote):
+        """Every unit and event channel gives the same counts, times, waveforms and labels in every segment."""
+        for seg_index in range(local.segment_count(0)):
+            for unit_index in range(local.spike_channels_count()):
+                self.assertEqual(
+                    remote.spike_count(0, seg_index, unit_index), local.spike_count(0, seg_index, unit_index)
+                )
+                assert_equal(
+                    remote.get_spike_timestamps(0, seg_index, unit_index, None, None),
+                    local.get_spike_timestamps(0, seg_index, unit_index, None, None),
+                )
+                assert_equal(
+                    remote.get_spike_raw_waveforms(0, seg_index, unit_index, None, None),
+                    local.get_spike_raw_waveforms(0, seg_index, unit_index, None, None),
+                )
+            for event_index in range(local.event_channels_count()):
+                self.assertEqual(
+                    remote.event_count(0, seg_index, event_index), local.event_count(0, seg_index, event_index)
+                )
+                remote_times, _, remote_labels = remote.get_event_timestamps(0, seg_index, event_index, None, None)
+                local_times, _, local_labels = local.get_event_timestamps(0, seg_index, event_index, None, None)
+                assert_equal(remote_times, local_times)
+                assert_equal(remote_labels, local_labels)
+
+    def _assert_iter_spikes_matches_per_unit(self, reader, packets_per_piece):
+        """iter_spikes, concatenated per unit, equals the per-unit methods, for every segment."""
+        for seg_index in range(reader.segment_count(0)):
+            times, waveforms = {}, {}
+            for piece in reader.iter_spikes(seg_index, packets_per_piece=packets_per_piece):
+                for unit_index, (unit_times, unit_waveforms) in piece.items():
+                    times.setdefault(unit_index, []).append(unit_times)
+                    waveforms.setdefault(unit_index, []).append(unit_waveforms)
+            for unit_index in range(reader.spike_channels_count()):
+                expected_times = reader.get_spike_timestamps(0, seg_index, unit_index, None, None)
+                expected_waveforms = reader.get_spike_raw_waveforms(0, seg_index, unit_index, None, None)
+                if len(expected_times) == 0:
+                    self.assertNotIn(unit_index, times)
+                    continue
+                assert_equal(np.concatenate(times[unit_index]), expected_times)
+                assert_equal(np.concatenate(waveforms[unit_index]), expected_waveforms)
 
     def _assert_same_signals(self, local, remote):
         """Every segment and stream gives the same samples, and for PTP the same timestamps, whole and in part."""
@@ -601,10 +649,13 @@ class TestBlackrockRawIO(
         # One NSx at a time: its ns4 and ns6 split into different numbers of segments,
         # which neo refuses to combine whether the files are local or remote.
         for nsx_nb in (4, 6):
-            local, remote = self._open_local_and_from_memory(entity, nsx_to_load=nsx_nb, gap_tolerance_ms=0)
+            local, remote = self._open_local_and_from_memory(
+                entity, nev_packets_per_piece=7, nsx_to_load=nsx_nb, gap_tolerance_ms=0
+            )
             self.assertGreater(local.segment_count(0), 1)  # the gaps really split it
             assert_equal(remote.header, local.header)
             self._assert_same_signals(local, remote)
+            self._assert_same_spikes_and_events(local, remote)
 
             # Without a tolerance both must refuse, with the same gap report.
             with self.assertRaises(ValueError) as local_error:
@@ -612,6 +663,71 @@ class TestBlackrockRawIO(
             with self.assertRaises(ValueError) as remote_error:
                 BlackrockRawIO(filename=f"memory:///{entity}", nsx_to_load=nsx_nb).parse_header()
             self.assertEqual(str(remote_error.exception), str(local_error.exception))
+
+    nev_entities = [
+        "blackrock/FileSpec2.3001",
+        "blackrock/blackrock_2_1/l101210-001",
+        "blackrock/blackrock_3_0/file_spec_3_0",
+        "blackrock/blackrock_3_0_ptp/20231027-125608-001",
+        "blackrock/segment/PauseCorrect/pause_correct",
+        "blackrock/segment/ResetCorrect/reset",
+    ]
+
+    def test_spikes_and_events_from_memory_url_match_local(self):
+        """
+        Spikes and events read from a memory:// URL match the local reads, with the NEV scanned
+        in pieces of 7 packets so that segments and units straddle many piece boundaries.
+        """
+        for entity in self.nev_entities:
+            local, remote = self._open_local_and_from_memory(entity, nev_packets_per_piece=7)
+            assert_equal(remote.header, local.header)
+            # Bounded memory: a scanned NEV keeps no spike packets (2.3 is still read whole).
+            self.assertEqual("Spikes" in remote.nev_data, remote._nev_spec == "2.3")
+            self._assert_same_spikes_and_events(local, remote)
+
+    def test_nev_only_from_memory_url_matches_local(self):
+        """A recording opened from its .nev alone gets the same segments and spikes remotely as locally."""
+        import shutil
+        import tempfile
+
+        import fsspec
+
+        for entity in [
+            "blackrock/blackrock_3_0/file_spec_3_0",
+            "blackrock/blackrock_3_0_ptp/20231027-125608-001",
+            # A 3.0 NEV whose timestamps jump back three times: four segments found by the scan.
+            "blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes",
+        ]:
+            folder = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, folder)
+            shutil.copy(self.get_local_path(entity) + ".nev", folder)
+            local_base = str(Path(folder) / Path(entity).name)
+            local = BlackrockRawIO(filename=local_base)
+            local.parse_header()
+            fs = fsspec.filesystem("memory")
+            fs.pipe(f"/nev_only/{entity}.nev", Path(self.get_local_path(entity) + ".nev").read_bytes())
+            self.addCleanup(fs.rm, f"/nev_only/{entity}.nev")
+            # A piece of 1 packet puts a piece boundary before every packet, so every
+            # timestamp jump is found only across a boundary.
+            for packets_per_piece in (1, 7):
+                remote = BlackrockRawIO(filename=f"memory:///nev_only/{entity}")
+                remote._nev_packets_per_piece = packets_per_piece
+                remote.parse_header()
+                remote._nev_packets_per_piece = 4096
+                assert_equal(remote.header, local.header)
+                self.assertEqual(remote.segment_count(0), local.segment_count(0))
+                self._assert_same_spikes_and_events(local, remote)
+            self._assert_iter_spikes_matches_per_unit(remote, packets_per_piece=5)
+
+    def test_iter_spikes_matches_per_unit_methods(self):
+        """iter_spikes gives every unit's spikes, local or remote, whatever the piece size."""
+        for entity in self.nev_entities:
+            local, remote = self._open_local_and_from_memory(entity, nev_packets_per_piece=7)
+            # Tiny pieces where segments make piece boundaries matter; one piece elsewhere.
+            sizes = (5, 1 << 18) if local.segment_count(0) > 1 else (1 << 18,)
+            for packets_per_piece in sizes:
+                self._assert_iter_spikes_matches_per_unit(local, packets_per_piece)
+                self._assert_iter_spikes_matches_per_unit(remote, packets_per_piece)
 
     def test_timestamp_gap_scan_matches_reader_on_ptp_file(self):
         """
