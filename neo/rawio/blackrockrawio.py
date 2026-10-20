@@ -984,6 +984,13 @@ class BlackrockRawIO(BaseRawIO):
 
     def _spike_count(self, block_index, seg_index, unit_index):
         channel_id, unit_id = self.internal_unit_ids[unit_index]
+        if self._nev_spikes is not None:
+            # Counted while the NEV was scanned at open, so no further pass is needed.
+            return sum(
+                n
+                for (raw_seg, ch, unit), n in self._nev_spikes["counts"].items()
+                if ch == channel_id and unit == unit_id and self._spike_segment_ids([raw_seg])[0] == seg_index
+            )
 
         all_spikes, event_segment_ids = self._spike_records(channel_id, unit_id)
         # Selected by segment id, as _get_spike_timestamps does, so the count always equals
@@ -1996,6 +2003,7 @@ class BlackrockRawIO(BaseRawIO):
         kept_types = None
         units = {}
         seg_times = {}  # raw segment id -> [first, last, lowest, highest]
+        counts = {}  # (raw segment id, channel id, unit id) -> spikes
         state = self._new_nev_segment_state()
         for start, raw in self._iter_nev_pieces():
             masks, types = self._nev_masks_and_types(raw, spec)
@@ -2012,6 +2020,11 @@ class BlackrockRawIO(BaseRawIO):
                 np.stack((spikes["packet_id"], spikes["unit_class_nb"]), axis=1), axis=0
             ):
                 units.setdefault(int(channel_id), set()).add(int(unit_id))
+            keys, n = np.unique(
+                np.stack((spike_ids, spikes["packet_id"], spikes["unit_class_nb"]), axis=1), axis=0, return_counts=True
+            )
+            for (seg, channel_id, unit_id), count in zip(keys.tolist(), n.tolist()):
+                counts[(seg, channel_id, unit_id)] = counts.get((seg, channel_id, unit_id), 0) + count
             for seg in np.unique(spike_ids):
                 seg_ts = spikes["timestamp"][spike_ids == seg]
                 times = seg_times.setdefault(int(seg), [seg_ts[0], seg_ts[-1], seg_ts.min(), seg_ts.max()])
@@ -2037,7 +2050,13 @@ class BlackrockRawIO(BaseRawIO):
                 np.concatenate(records) if records else np.empty(0, dtype=kept_types[data_type]),
                 np.concatenate(record_ids) if record_ids else np.empty(0, dtype=int),
             )
-        self._nev_spikes = {"units": units, "seg_times": seg_times, "deleted_segments": [], "types": kept_types}
+        self._nev_spikes = {
+            "units": units,
+            "seg_times": seg_times,
+            "counts": counts,
+            "deleted_segments": [],
+            "types": kept_types,
+        }
         return data
 
     def _spike_segment_ids(self, raw_ids):
@@ -2102,18 +2121,20 @@ class BlackrockRawIO(BaseRawIO):
         waveforms = unit_spikes["waveform"].view(dt1)["ch_waveform"].flatten().view(wf_dtype)
         return waveforms.reshape(int(unit_spikes.size), 1, int(wf_size))
 
-    def iter_spikes(self, seg_index=0, packets_per_piece=None):
+    def iter_spikes(self, seg_index=None, packets_per_piece=None):
         """
-        Yield one segment's spikes a piece at a time, for every unit, reading the NEV once.
+        Yield spikes a piece at a time, for every unit, reading the NEV once.
 
         neo's per-unit methods (get_spike_timestamps, get_spike_raw_waveforms) each have to
         look at every packet, because a unit's spikes are spread through the whole file; on a
         large remote NEV, calling them for every unit reads the file once per unit. This reads
-        it once in total, and memory stays at about one piece.
+        it once in total, for every segment (or only `seg_index`), and memory stays at about
+        one piece.
 
-        Each item is a dict {unit_index: (timestamps, waveforms)}: raw timestamps and raw
-        waveforms shaped (n, 1, samples), as the per-unit methods return them. Concatenated
-        over all items, each unit's arrays equal what those methods return for this segment.
+        Each item is (seg_index, {unit_index: (timestamps, waveforms)}): raw timestamps and raw
+        waveforms shaped (n, 1, samples), as the per-unit methods return them. Items come in
+        file order, so concatenating a unit's arrays over the items of one segment equals what
+        those methods return for that segment.
         """
         step = packets_per_piece or self._nev_packets_per_piece
         unit_index_of = {pair: i for i, pair in enumerate(self.internal_unit_ids)}
@@ -2135,19 +2156,23 @@ class BlackrockRawIO(BaseRawIO):
                 self._nev_packets_per_piece = saved
 
         for spikes, ids in pieces():
-            spikes = spikes[ids == seg_index]
-            if len(spikes) == 0:
-                continue
-            piece = {}
-            keys = np.stack((spikes["packet_id"], spikes["unit_class_nb"]), axis=1)
-            for channel_id, unit_id in np.unique(keys, axis=0):
-                unit_index = unit_index_of.get((int(channel_id), int(unit_id)))
-                if unit_index is None:
+            for seg in [seg_index] if seg_index is not None else np.unique(ids).tolist():
+                seg_spikes = spikes[ids == seg]
+                if len(seg_spikes) == 0:
                     continue
-                unit_spikes = spikes[(keys[:, 0] == channel_id) & (keys[:, 1] == unit_id)]
-                piece[unit_index] = (unit_spikes["timestamp"], self._spike_waveforms(unit_spikes, int(channel_id)))
-            if piece:
-                yield piece
+                piece = {}
+                keys = np.stack((seg_spikes["packet_id"], seg_spikes["unit_class_nb"]), axis=1)
+                for channel_id, unit_id in np.unique(keys, axis=0):
+                    unit_index = unit_index_of.get((int(channel_id), int(unit_id)))
+                    if unit_index is None:
+                        continue
+                    unit_spikes = seg_spikes[(keys[:, 0] == channel_id) & (keys[:, 1] == unit_id)]
+                    piece[unit_index] = (
+                        unit_spikes["timestamp"],
+                        self._spike_waveforms(unit_spikes, int(channel_id)),
+                    )
+                if piece:
+                    yield int(seg), piece
 
     def _get_reset_event_mask(self, raw_event_data, masks, spec):
         """

@@ -589,21 +589,31 @@ class TestBlackrockRawIO(
                 assert_equal(remote_labels, local_labels)
 
     def _assert_iter_spikes_matches_per_unit(self, reader, packets_per_piece):
-        """iter_spikes, concatenated per unit, equals the per-unit methods, for every segment."""
-        for seg_index in range(reader.segment_count(0)):
+        """
+        iter_spikes, concatenated per segment and unit, equals the per-unit methods, whether it
+        streams every segment in one call or one segment per call.
+        """
+        all_segments = [reader.iter_spikes(packets_per_piece=packets_per_piece)]
+        one_segment = [
+            reader.iter_spikes(k, packets_per_piece=packets_per_piece) for k in range(reader.segment_count(0))
+        ]
+        for calls in (all_segments, one_segment):
             times, waveforms = {}, {}
-            for piece in reader.iter_spikes(seg_index, packets_per_piece=packets_per_piece):
-                for unit_index, (unit_times, unit_waveforms) in piece.items():
-                    times.setdefault(unit_index, []).append(unit_times)
-                    waveforms.setdefault(unit_index, []).append(unit_waveforms)
-            for unit_index in range(reader.spike_channels_count()):
-                expected_times = reader.get_spike_timestamps(0, seg_index, unit_index, None, None)
-                expected_waveforms = reader.get_spike_raw_waveforms(0, seg_index, unit_index, None, None)
-                if len(expected_times) == 0:
-                    self.assertNotIn(unit_index, times)
-                    continue
-                assert_equal(np.concatenate(times[unit_index]), expected_times)
-                assert_equal(np.concatenate(waveforms[unit_index]), expected_waveforms)
+            for call in calls:
+                for seg_index, piece in call:
+                    for unit_index, (unit_times, unit_waveforms) in piece.items():
+                        times.setdefault((seg_index, unit_index), []).append(unit_times)
+                        waveforms.setdefault((seg_index, unit_index), []).append(unit_waveforms)
+            for seg_index in range(reader.segment_count(0)):
+                for unit_index in range(reader.spike_channels_count()):
+                    expected_times = reader.get_spike_timestamps(0, seg_index, unit_index, None, None)
+                    expected_waveforms = reader.get_spike_raw_waveforms(0, seg_index, unit_index, None, None)
+                    key = (seg_index, unit_index)
+                    if len(expected_times) == 0:
+                        self.assertNotIn(key, times)
+                        continue
+                    assert_equal(np.concatenate(times[key]), expected_times)
+                    assert_equal(np.concatenate(waveforms[key]), expected_waveforms)
 
     def _assert_same_signals(self, local, remote):
         """Every segment and stream gives the same samples, and for PTP the same timestamps, whole and in part."""
@@ -819,6 +829,42 @@ class TestBlackrockRawIO(
         for reader in self._open_nev_locally_and_from_memory(base):
             self.assertEqual(reader.segment_count(0), 2)
             self.assertEqual(self._spikes_per_segment(reader), [before, after])
+
+    def test_scanned_nev_is_read_once_for_all_spikes_and_never_for_counts(self):
+        """
+        On a scanned NEV, spike_count reads nothing (the counts come from the open-time scan),
+        and iter_spikes over every segment reads the file once, however many segments it has.
+        """
+        import shutil
+        import tempfile
+
+        import fsspec
+
+        entity = "blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes"
+        fs = fsspec.filesystem("memory")
+        fs.pipe(f"/once/{entity}.nev", Path(self.get_local_path(entity) + ".nev").read_bytes())
+        self.addCleanup(fs.rm, f"/once/{entity}.nev")
+        reader = BlackrockRawIO(filename=f"memory:///once/{entity}")
+        reader.parse_header()
+        self.assertEqual(reader.segment_count(0), 4)
+
+        passes = []
+        scan = reader._iter_nev_pieces
+
+        def counted_scan():
+            passes.append(1)
+            return scan()
+
+        reader._iter_nev_pieces = counted_scan
+        counts = [
+            reader.spike_count(0, seg, unit)
+            for seg in range(reader.segment_count(0))
+            for unit in range(reader.spike_channels_count())
+        ]
+        self.assertEqual(len(passes), 0)
+        streamed = sum(len(times) for _, piece in reader.iter_spikes() for times, _ in piece.values())
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(streamed, sum(counts))
 
     def test_timestamp_gap_scan_matches_reader_on_ptp_file(self):
         """
