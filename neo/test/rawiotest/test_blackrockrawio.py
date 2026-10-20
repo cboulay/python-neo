@@ -535,6 +535,29 @@ class TestBlackrockRawIO(
         with self.assertRaises(ValueError):
             reader.get_analogsignal_buffer_description(block_index=0, seg_index=0, buffer_id=buffer_id)
 
+    def test_header_from_memory_url_matches_local(self):
+        """
+        Test opening a recording by memory:// URL gives the same header as opening it locally.
+        """
+        import fsspec
+
+        fs = fsspec.filesystem("memory")
+        self.addCleanup(fs.rm, "/blackrock", recursive=True)
+        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
+        for entity in test_entities:
+            local_base = self.get_local_path(entity)
+            for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
+                local_file = Path(local_base + ext)
+                if local_file.exists():
+                    fs.pipe(f"{entity}{ext}", local_file.read_bytes())
+            reader = BlackrockRawIO(filename=str(local_base))
+            reader.parse_header()
+
+            remote = BlackrockRawIO(filename=f"memory:///{entity}")
+            remote.parse_header()
+
+            assert_equal(reader.header, remote.header)
+
 
 if __name__ == "__main__":
     unittest.main()

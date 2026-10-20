@@ -61,6 +61,7 @@ TODO:
 """
 
 import datetime
+import io
 import mmap
 import os
 import re
@@ -124,6 +125,10 @@ class BlackrockRawIO(BaseRawIO):
         - PTP format (v3.0-ptp): Gaps in per-sample timestamps
         - Standard format (v2.2/2.3/3.0): Gaps between data blocks
 
+    storage_options : dict | None, default: None
+        Dictionary of storage options to pass to the underlying file system.
+        This can include options such as credentials, caching behavior, etc.
+
     Notes
     -----
     * Note: This routine will handle files according to specification 2.1, 2.2,
@@ -169,12 +174,21 @@ class BlackrockRawIO(BaseRawIO):
         load_nev=True,
         verbose=False,
         gap_tolerance_ms=None,
+        storage_options=None,
     ):
         BaseRawIO.__init__(self)
 
         self.gap_tolerance_ms = gap_tolerance_ms
 
         self.filename = str(filename)
+        if "://" in self.filename:
+            try:
+                import fsspec
+            except ImportError:
+                raise ImportError("fsspec is required to handle URLs, run pip install neo[remote]")
+            self._fs, _ = fsspec.core.url_to_fs(self.filename, **(storage_options or {}))
+        else:
+            self._fs = None
 
         # remove extension from base _filenames
         for ext in self.extensions:
@@ -206,7 +220,7 @@ class BlackrockRawIO(BaseRawIO):
             else:
                 file2check = "".join([self._filenames[ext], os.path.extsep, ext])
 
-            if os.path.exists(file2check):
+            if self._exists(file2check):
                 self._avail_files[ext] = True
                 if ext.startswith("ns"):
                     self._avail_nsx.append(int(ext[-1]))
@@ -244,6 +258,16 @@ class BlackrockRawIO(BaseRawIO):
             "2.3": self._get_comment_evdict_spec_v21_22,
             "3.0": self._get_comment_evdict_spec_v21_22,
         }
+
+    def _exists(self, path: str) -> bool:
+        if self._fs is None:
+            return os.path.exists(path)
+        return self._fs.exists(path)
+
+    def _open(self, path: str) -> io.IOBase:
+        if self._fs is None:
+            return open(path, "rb")
+        return self._fs.open(path, "rb")
 
     def _parse_header(self):
 
@@ -739,14 +763,14 @@ class BlackrockRawIO(BaseRawIO):
             self._nsx_fids = {}
         if nsx_nb not in self._nsx_fids:
             filename = f"{self._filenames['nsx']}.ns{nsx_nb}"
-            self._nsx_fids[nsx_nb] = open(filename, "rb")
+            self._nsx_fids[nsx_nb] = self._open(filename)
         return self._nsx_fids[nsx_nb]
 
     def _get_nev_fid(self):
         """Open NEV file on demand and cache the file descriptor for reuse."""
         if not hasattr(self, "_nev_fid"):
             filename = f"{self._filenames['nev']}.nev"
-            self._nev_fid = open(filename, "rb")
+            self._nev_fid = self._open(filename)
         return self._nev_fid
 
     def _get_analogsignal_chunk(self, block_index, seg_index, i_start, i_stop, stream_index, channel_indexes):
@@ -1746,13 +1770,20 @@ class BlackrockRawIO(BaseRawIO):
         data_packages_in_bytes = self._get_file_size(filename) - header_size
         n_packets = int(data_packages_in_bytes / packet_size_bytes)
 
-        raw_data = np.memmap(
-            filename,
-            offset=header_size,
-            dtype=dt0,
-            shape=(n_packets,),
-            mode="r",
-        )
+        # this is the one place a branch will live outside the file access method since it's about how to read (map vs copy) and not where the file is located
+        # loca files stay memory mapped, so the NEV isn't loaded into memory and remote files can't be memory-mapped, so their packets are copied
+        if self._fs is None:
+            raw_data = np.memmap(
+                filename,
+                offset=header_size,
+                dtype=dt0,
+                shape=(n_packets,),
+                mode="r",
+            )
+        else:
+            raw_data = read_records_from_opened_file(
+                self._get_nev_fid(), dtype=dt0, offset=header_size, count=n_packets
+            )
 
         # Get packet identifiers and types directly from spec-based dictionaries
         packet_identifiers = NEV_PACKET_IDENTIFIERS_BY_SPEC[spec]
@@ -2007,14 +2038,17 @@ class BlackrockRawIO(BaseRawIO):
 
         return nev_parameters[param_name]
 
-    def _get_file_size(self, filename):
+    def _get_file_size(self, filename: str) -> int:
         """
         Returns the file size in bytes for the given file.
         """
-        filebuf = open(filename, "rb")
-        filebuf.seek(0, os.SEEK_END)
-        file_size = int(filebuf.tell())
-        filebuf.close()
+        if self._fs is None:
+            filebuf = open(filename, "rb")
+            filebuf.seek(0, os.SEEK_END)
+            file_size = int(filebuf.tell())
+            filebuf.close()
+        else:
+            file_size = self._fs.size(filename)
 
         return file_size
 
