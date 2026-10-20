@@ -78,7 +78,11 @@ from .baserawio import (
     _spike_channel_dtype,
     _event_channel_dtype,
 )
-from .utils import read_records_from_opened_file
+from .utils import (
+    find_timestamp_gaps_in_opened_file,
+    read_records_from_opened_file,
+    read_strided_from_opened_file,
+)
 
 from neo.core import NeoReadWriteError
 
@@ -488,17 +492,10 @@ class BlackrockRawIO(BaseRawIO):
                     if "timestamps_memmap_kwargs" in seg_header:
                         # FileSpec 3.0 with PTP -- read first/last timestamps on demand
                         ts_kw = seg_header["timestamps_memmap_kwargs"]
-                        fid = self._get_nsx_fid(nsx_nb)
-                        ts_array = self._create_mmap_view(
-                            fid=fid,
-                            dtype=ts_kw["dtype"],
-                            offset=ts_kw["offset"],
-                            num_samples=ts_kw["num_samples"],
-                            packet_size=ts_kw.get("packet_size"),
-                            item_offset=ts_kw.get("item_offset", 0),
-                        )
-                        t_start = float(ts_array[0]) / ts_res
-                        t_stop = max(t_stop, float(ts_array[-1]) / ts_res + sec_per_samp)
+                        first_ts = self._read_ptp_ticks(nsx_nb, ts_kw, 0, 1)[0]
+                        last_ts = self._read_ptp_ticks(nsx_nb, ts_kw, length - 1, length)[0]
+                        t_start = float(first_ts) / ts_res
+                        t_stop = max(t_stop, float(last_ts) / ts_res + sec_per_samp)
                     elif timestamp is None:
                         # V2.1 format has no timestamps
                         t_start = 0.0
@@ -834,24 +831,45 @@ class BlackrockRawIO(BaseRawIO):
         """
 
         dtype = np.dtype(memmap_kwargs["dtype"])
-        itemsize = dtype.itemsize
-        packet_size = memmap_kwargs.get("packet_size") or num_channels * itemsize
+        # Standard files have no packet_size: rows sit back to back.
+        packet_size = memmap_kwargs.get("packet_size") or num_channels * dtype.itemsize
         item_offset = memmap_kwargs.get("item_offset", 0)
         if i_start is None:
             i_start = 0
         if i_stop is None:
             i_stop = memmap_kwargs["num_samples"]
-        first = memmap_kwargs["offset"] + i_start * packet_size + item_offset
-        n_rows = i_stop - i_start
-        if n_rows > 0:
-            length = (n_rows - 1) * packet_size + num_channels * itemsize
-        else:
-            length = 0
-        fid.seek(first)
-        data = fid.read(length)
-        if len(data) != length:
-            raise ValueError(f"Expected {length} bytes at offset {first}, got {len(data)}")
-        return np.ndarray(shape=(n_rows, num_channels), dtype=dtype, buffer=data, strides=(packet_size, itemsize))
+        return read_strided_from_opened_file(
+            fid,
+            dtype,
+            offset=memmap_kwargs["offset"] + i_start * packet_size + item_offset,
+            stride=packet_size,
+            count=i_stop - i_start,
+            num_values=num_channels,
+        )
+
+    def _read_ptp_ticks(self, nsx_nb: int, ts_kw: dict, i_start: int, i_stop: int) -> np.ndarray:
+        """
+        Raw PTP timestamps (uint64 ticks) for samples [i_start, i_stop) of one segment.
+
+        Local files take them from a memory map; remote files read only that range.
+        """
+        fid = self._get_nsx_fid(nsx_nb)
+        if self._fs is None:
+            return self._create_mmap_view(
+                fid=fid,
+                dtype=ts_kw["dtype"],
+                offset=ts_kw["offset"],
+                num_samples=ts_kw["num_samples"],
+                packet_size=ts_kw.get("packet_size"),
+                item_offset=ts_kw.get("item_offset", 0),
+            )[i_start:i_stop]
+        return read_strided_from_opened_file(
+            fid,
+            ts_kw["dtype"],
+            offset=ts_kw["offset"] + ts_kw.get("item_offset", 0) + i_start * ts_kw["packet_size"],
+            stride=ts_kw["packet_size"],
+            count=i_stop - i_start,
+        )
 
     def _get_analogsignal_buffer_description(self, block_index: int, seg_index: int, buffer_id: str) -> dict:
         """Get the description of the analog signal buffer.
@@ -944,17 +962,8 @@ class BlackrockRawIO(BaseRawIO):
         # PTP format: read timestamps on demand via strided mmap view
         if "timestamps_memmap_kwargs" in seg:
             ts_kw = seg["timestamps_memmap_kwargs"]
-            fid = self._get_nsx_fid(nsx_nb)
-            timestamps = self._create_mmap_view(
-                fid=fid,
-                dtype=ts_kw["dtype"],
-                offset=ts_kw["offset"],
-                num_samples=ts_kw["num_samples"],
-                packet_size=ts_kw.get("packet_size"),
-                item_offset=ts_kw.get("item_offset", 0),
-            )
             ts_res = float(self._nsx_basic_header[nsx_nb]["timestamp_resolution"])
-            return timestamps[i_start:i_stop].astype("float64") / ts_res
+            return self._read_ptp_ticks(nsx_nb, ts_kw, i_start, i_stop).astype("float64") / ts_res
         else:
             # Non-PTP: reconstruct from t_start + index / sampling_rate
             t_start = self._sigs_t_starts[nsx_nb][seg_index]
@@ -1480,7 +1489,7 @@ class BlackrockRawIO(BaseRawIO):
             }
         ]
 
-    def _format_gap_report(self, gap_indices, timestamps_in_seconds, time_differences, nsx_nb):
+    def _format_gap_report(self, gap_indices, gap_sizes_s, gap_before_s, first_s, nsx_nb):
         """
         Format a detailed gap report showing where timestamp discontinuities occur.
 
@@ -1488,10 +1497,12 @@ class BlackrockRawIO(BaseRawIO):
         ----------
         gap_indices : np.ndarray
             Indices where gaps were detected
-        timestamps_in_seconds : np.ndarray
-            All timestamps converted to seconds
-        time_differences : np.ndarray
-            Time differences between consecutive timestamps
+        gap_sizes_s : np.ndarray
+            Size of each gap in seconds
+        gap_before_s : np.ndarray
+            Timestamp, in seconds, of the sample just before each gap
+        first_s : float
+            First timestamp of the file in seconds
         nsx_nb : int
             NSX file number for the report
 
@@ -1501,9 +1512,8 @@ class BlackrockRawIO(BaseRawIO):
             Formatted gap report with table
         """
         # Calculate gap details
-        gap_durations_seconds = time_differences[gap_indices]
-        gap_durations_ms = gap_durations_seconds * 1000
-        gap_positions_seconds = timestamps_in_seconds[gap_indices] - timestamps_in_seconds[0]
+        gap_durations_ms = gap_sizes_s * 1000
+        gap_positions_seconds = gap_before_s - first_s
 
         # Build gap detail table
         gap_detail_lines = [
@@ -1580,32 +1590,47 @@ class BlackrockRawIO(BaseRawIO):
                 ts_kw = block_info["ptp_timestamps_memmap_kwargs"]
                 samples_kw = block_info["memmap_kwargs"]
 
-                # Read timestamps via strided mmap view for gap detection
-                fid = self._get_nsx_fid(nsx_nb)
-                timestamps = self._create_mmap_view(
-                    fid=fid,
-                    dtype=ts_kw["dtype"],
-                    offset=ts_kw["offset"],
-                    num_samples=ts_kw["num_samples"],
-                    packet_size=ts_kw.get("packet_size"),
-                    item_offset=ts_kw.get("item_offset", 0),
-                )
-
-                # Analyze timestamp gaps
                 sampling_rate = self._nsx_sampling_frequency[nsx_nb]
-
                 # Detection threshold: use strict 2x sampling period to find ALL gaps
                 detection_threshold = 2.0 / sampling_rate
-
                 timestamps_sampling_rate = self._nsx_basic_header[nsx_nb]["timestamp_resolution"]
-                timestamps_in_seconds = timestamps / timestamps_sampling_rate
 
-                time_differences = np.diff(timestamps_in_seconds)
-                gap_indices = np.argwhere(time_differences > detection_threshold).flatten()
+                if self._fs is None:
+                    # Read timestamps via strided mmap view for gap detection
+                    fid = self._get_nsx_fid(nsx_nb)
+                    timestamps = self._create_mmap_view(
+                        fid=fid,
+                        dtype=ts_kw["dtype"],
+                        offset=ts_kw["offset"],
+                        num_samples=ts_kw["num_samples"],
+                        packet_size=ts_kw.get("packet_size"),
+                        item_offset=ts_kw.get("item_offset", 0),
+                    )
+                    timestamps_in_seconds = timestamps / timestamps_sampling_rate
+                    time_differences = np.diff(timestamps_in_seconds)
+                    gap_indices = np.argwhere(time_differences > detection_threshold).flatten()
+                    gap_sizes_s = time_differences[gap_indices]
+                    gap_before_s = timestamps_in_seconds[gap_indices]
+                    first_s = timestamps_in_seconds[0] if len(timestamps_in_seconds) else None
+                else:
+                    # A remote file cannot be memory-mapped, and its timestamps are spread
+                    # through the whole file: scan them in pieces, keeping only the gaps.
+                    gaps = find_timestamp_gaps_in_opened_file(
+                        self._get_nsx_fid(nsx_nb),
+                        offset=ts_kw["offset"] + ts_kw.get("item_offset", 0),
+                        packet_size=ts_kw["packet_size"],
+                        num_packets=int(ts_kw["num_samples"]),
+                        timestamp_resolution=float(timestamps_sampling_rate),
+                        threshold_s=detection_threshold,
+                    )
+                    gap_indices = gaps["indices"]
+                    gap_sizes_s = gaps["sizes_s"]
+                    gap_before_s = gaps["before_s"]
+                    first_s = gaps["first_s"]
 
                 # If gaps found, check user's tolerance
                 if len(gap_indices) > 0:
-                    gap_report = self._format_gap_report(gap_indices, timestamps_in_seconds, time_differences, nsx_nb)
+                    gap_report = self._format_gap_report(gap_indices, gap_sizes_s, gap_before_s, first_s, nsx_nb)
 
                     # Error by default - user must opt-in to segmentation
                     if self.gap_tolerance_ms is None:
@@ -1618,7 +1643,7 @@ class BlackrockRawIO(BaseRawIO):
 
                     # User provided tolerance - filter gaps and segment
                     gap_tolerance_s = self.gap_tolerance_ms / 1000.0
-                    significant_gap_mask = time_differences[gap_indices] > gap_tolerance_s
+                    significant_gap_mask = gap_sizes_s > gap_tolerance_s
                     significant_gap_indices = gap_indices[significant_gap_mask]
 
                     # Use significant gaps for segmentation (no warning - user opted in)

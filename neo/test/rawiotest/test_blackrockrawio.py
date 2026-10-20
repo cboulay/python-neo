@@ -539,72 +539,109 @@ class TestBlackrockRawIO(
         """
         Test opening a recording by memory:// URL gives the same header as opening it locally.
         """
+
+    def _open_local_and_from_memory(self, entity, **kwargs):
+        """Open a recording locally and, after copying its files into fsspec's memory filesystem, by memory:// URL."""
         import fsspec
 
         fs = fsspec.filesystem("memory")
-        self.addCleanup(fs.rm, "/blackrock", recursive=True)
-        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
-        for entity in test_entities:
-            local_base = self.get_local_path(entity)
-            for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
-                local_file = Path(local_base + ext)
-                if local_file.exists():
-                    fs.pipe(f"{entity}{ext}", local_file.read_bytes())
-            reader = BlackrockRawIO(filename=str(local_base))
-            reader.parse_header()
+        local_base = self.get_local_path(entity)
+        for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
+            local_file = Path(local_base + ext)
+            if local_file.exists() and not fs.exists(f"/{entity}{ext}"):
+                fs.pipe(f"/{entity}{ext}", local_file.read_bytes())
+                self.addCleanup(fs.rm, f"/{entity}{ext}")
+        local = BlackrockRawIO(filename=local_base, **kwargs)
+        local.parse_header()
+        remote = BlackrockRawIO(filename=f"memory:///{entity}", **kwargs)
+        remote.parse_header()
+        return local, remote
 
-            remote = BlackrockRawIO(filename=f"memory:///{entity}")
-            remote.parse_header()
+    def _assert_same_signals(self, local, remote):
+        """Every segment and stream gives the same samples, and for PTP the same timestamps, whole and in part."""
+        for seg_index in range(local.segment_count(0)):
+            for stream_index in range(local.signal_streams_count()):
+                size = local.get_signal_size(0, seg_index, stream_index)
+                # A window in the middle, so a remote read that ignored i_start would differ.
+                window = dict(i_start=size // 3, i_stop=min(size, size // 3 + 100))
+                for kw in ({}, window):
+                    assert_equal(
+                        remote.get_analogsignal_chunk(seg_index=seg_index, stream_index=stream_index, **kw),
+                        local.get_analogsignal_chunk(seg_index=seg_index, stream_index=stream_index, **kw),
+                    )
+                    i_start, i_stop = kw.get("i_start"), kw.get("i_stop")
+                    assert_equal(
+                        remote._get_blackrock_timestamps(0, seg_index, i_start, i_stop, stream_index),
+                        local._get_blackrock_timestamps(0, seg_index, i_start, i_stop, stream_index),
+                    )
 
-            assert_equal(reader.header, remote.header)
+    def test_header_from_memory_url_matches_local(self):
+        """
+        Opening a recording by memory:// URL gives the same header as opening it locally, PTP included.
+        """
+        for entity in self.entities_to_test:
+            local, remote = self._open_local_and_from_memory(entity)
+            assert_equal(remote.header, local.header)
 
     def test_chunks_from_memory_url_match_local(self):
         """
-        Test chunks read from a memory:// URL match the same chunks read locally.
+        Chunks and timestamps read from a memory:// URL match the same reads done locally, PTP included.
         """
-        import fsspec
+        for entity in self.entities_to_test:
+            local, remote = self._open_local_and_from_memory(entity)
+            self._assert_same_signals(local, remote)
 
-        fs = fsspec.filesystem("memory")
-        self.addCleanup(fs.rm, "/blackrock", recursive=True)
-        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
-        for entity in test_entities:
-            local_base = self.get_local_path(entity)
-            for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
-                local_file = Path(local_base + ext)
-                if local_file.exists():
-                    fs.pipe(f"{entity}{ext}", local_file.read_bytes())
-            reader = BlackrockRawIO(filename=local_base)
+    def test_ptp_with_gaps_from_memory_url_matches_local(self):
+        """
+        A PTP recording with missing samples is segmented at the same gaps, and reads the same, from a memory:// URL.
+
+        Locally the gaps come from the whole timestamp array at once; remotely from a scan in pieces.
+        """
+        entity = "blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes"
+        # One NSx at a time: its ns4 and ns6 split into different numbers of segments,
+        # which neo refuses to combine whether the files are local or remote.
+        for nsx_nb in (4, 6):
+            local, remote = self._open_local_and_from_memory(entity, nsx_to_load=nsx_nb, gap_tolerance_ms=0)
+            self.assertGreater(local.segment_count(0), 1)  # the gaps really split it
+            assert_equal(remote.header, local.header)
+            self._assert_same_signals(local, remote)
+
+            # Without a tolerance both must refuse, with the same gap report.
+            with self.assertRaises(ValueError) as local_error:
+                BlackrockRawIO(filename=self.get_local_path(entity), nsx_to_load=nsx_nb).parse_header()
+            with self.assertRaises(ValueError) as remote_error:
+                BlackrockRawIO(filename=f"memory:///{entity}", nsx_to_load=nsx_nb).parse_header()
+            self.assertEqual(str(remote_error.exception), str(local_error.exception))
+
+    def test_timestamp_gap_scan_matches_reader_on_ptp_file(self):
+        """
+        The piecewise gap scan finds the same gaps the reader finds in a real PTP recording with missing samples.
+        """
+        from neo.rawio.utils import find_timestamp_gaps_in_opened_file
+
+        local_base = self.get_local_path("blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes")
+        for nsx_nb in (4, 6):
+            # A tolerance of 0 makes every detected gap a segment boundary, so the
+            # segment sizes say exactly where the reader found gaps.
+            reader = BlackrockRawIO(filename=local_base, nsx_to_load=nsx_nb, gap_tolerance_ms=0)
             reader.parse_header()
-            remote = BlackrockRawIO(filename=f"memory:///{entity}")
-            remote.parse_header()
+            segments = reader._nsx_data_header[nsx_nb]
+            sizes = [int(seg["nb_data_points"]) for seg in segments]
+            expected = np.cumsum(sizes)[:-1] - 1
+            self.assertGreater(len(expected), 0)  # the file really has gaps
 
-            for block_index in range(reader.header["nb_block"]):
-                for seg_index in range(reader.header["nb_segment"][block_index]):
-                    for stream_index, _ in enumerate(reader.header["signal_streams"]["id"]):
-                        assert_equal(
-                            remote.get_analogsignal_chunk(
-                                block_index=block_index, seg_index=seg_index, stream_index=stream_index
-                            ),
-                            reader.get_analogsignal_chunk(
-                                block_index=block_index, seg_index=seg_index, stream_index=stream_index
-                            ),
-                        )
-                        assert_equal(
-                            remote.get_analogsignal_chunk(
-                                block_index=block_index,
-                                seg_index=seg_index,
-                                stream_index=stream_index,
-                                i_start=1000,
-                                i_stop=1100,
-                            ),
-                            reader.get_analogsignal_chunk(
-                                block_index=block_index,
-                                seg_index=seg_index,
-                                stream_index=stream_index,
-                                i_start=1000,
-                                i_stop=1100,
-                            ),
-                        )
+            ts_kw = segments[0]["timestamps_memmap_kwargs"]
+            with open(f"{local_base}.ns{nsx_nb}", "rb") as fid:
+                gaps = find_timestamp_gaps_in_opened_file(
+                    fid,
+                    offset=ts_kw["offset"] + ts_kw["item_offset"],
+                    packet_size=ts_kw["packet_size"],
+                    num_packets=sum(sizes),
+                    timestamp_resolution=float(reader._nsx_basic_header[nsx_nb]["timestamp_resolution"]),
+                    threshold_s=2.0 / reader._nsx_sampling_frequency[nsx_nb],
+                    packets_per_piece=16,  # small, so several gaps fall near piece boundaries
+                )
+            assert_equal(gaps["indices"], expected)
 
 
 if __name__ == "__main__":
