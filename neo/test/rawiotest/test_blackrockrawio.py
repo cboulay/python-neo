@@ -656,6 +656,8 @@ class TestBlackrockRawIO(
         A FileSpec 2.2 NEV written by Ripple Trellis keeps its spikes on electrodes above 255, as 2.3
         does (NeuralEnsemble/python-neo#1918). Trellis numbers its front-end ports 1-128, 129-256,
         257-384..., and this file has one spike on each of 28 electrodes between 257 and 306.
+        Its stimulation packets (5120 plus the electrode id) are not spikes: they are not read, and are
+        counted in nev_unmatched_packets with a warning.
         """
         filename = self.get_local_path("blackrock/version_2_2/spikes/electrode_ids_above_255/electrode_ids_above_255")
         reader = BlackrockRawIO(filename=filename)
@@ -667,6 +669,15 @@ class TestBlackrockRawIO(
             reader.get_spike_timestamps(0, 0, unit_index, None, None).size for unit_index in range(len(electrodes))
         ]
         self.assertEqual(spikes, [1] * 28)
+        self.assertEqual(reader.nev_unmatched_packets, {})
+
+        filename = self.get_local_path(
+            "blackrock/version_2_2/spikes/stim_electrode_ids_above_5120/stim_electrode_ids_above_5120"
+        )
+        reader = BlackrockRawIO(filename=filename, nsx_to_load=None)
+        with self.assertWarnsRegex(UserWarning, "32 NEV data packets match no packet type"):
+            reader.parse_header()
+        self.assertEqual(reader.nev_unmatched_packets, {5136: 14, 5139: 10, 5176: 6, 5209: 2})
 
 
 if __name__ == "__main__":
