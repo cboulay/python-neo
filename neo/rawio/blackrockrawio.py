@@ -187,6 +187,9 @@ class BlackrockRawIO(BaseRawIO):
         self._nev_packets_per_piece = 1 << 18
         # Summary of a NEV's spikes when it was scanned in pieces instead of read into memory.
         self._nev_spikes = None
+        # NEV data packets that match no packet type for the file's spec, by packet id: they are
+        # not read, so a caller can refuse a file whose data would otherwise be lost silently.
+        self.nev_unmatched_packets = {}
 
         self.filename = str(filename)
         if "://" in self.filename:
@@ -1888,6 +1891,8 @@ class BlackrockRawIO(BaseRawIO):
         packet_identifiers = NEV_PACKET_IDENTIFIERS_BY_SPEC[spec]
         masks, types = self._nev_masks_and_types(raw_data, spec)
 
+        self._count_unmatched_packets(raw_data, masks)
+        self._warn_unmatched_packets()
         event_segment_ids = self._get_event_segment_ids(raw_data, masks, spec)
 
         # Extract data for each packet type using view-then-mask pattern
@@ -2007,6 +2012,7 @@ class BlackrockRawIO(BaseRawIO):
         state = self._new_nev_segment_state()
         for start, raw in self._iter_nev_pieces():
             masks, types = self._nev_masks_and_types(raw, spec)
+            self._count_unmatched_packets(raw, masks)
             kept_types = types
             ids = self._nev_piece_segment_ids(raw, masks, spec, start, state)
             for data_type, (records, record_ids) in kept.items():
@@ -2041,6 +2047,7 @@ class BlackrockRawIO(BaseRawIO):
             )
         if spec in ["2.3", "3.0"]:
             self._nb_segment_nev = state["boundaries"] + 1
+        self._warn_unmatched_packets()
 
         if kept_types is None:  # a NEV with no packets
             _, kept_types = self._nev_masks_and_types(np.empty(0, dtype=self._nev_layout["dtype"]), spec)
@@ -2173,6 +2180,23 @@ class BlackrockRawIO(BaseRawIO):
                     )
                 if piece:
                     yield int(seg), piece
+
+    def _count_unmatched_packets(self, raw_data, masks):
+        """Add the packets of `raw_data` that match no packet type to nev_unmatched_packets."""
+        matched = np.any([mask for mask in masks.values()], axis=0) if masks else np.zeros(len(raw_data), bool)
+        ids, counts = np.unique(raw_data["packet_id"][~matched], return_counts=True)
+        for packet_id, count in zip(ids.tolist(), counts.tolist()):
+            self.nev_unmatched_packets[packet_id] = self.nev_unmatched_packets.get(packet_id, 0) + count
+
+    def _warn_unmatched_packets(self):
+        if self.nev_unmatched_packets:
+            total = sum(self.nev_unmatched_packets.values())
+            ids = sorted(self.nev_unmatched_packets)
+            shown = ", ".join(str(i) for i in ids[:10]) + (", ..." if len(ids) > 10 else "")
+            warnings.warn(
+                f"{total} NEV data packets match no packet type of FileSpec {self._nev_spec} and "
+                f"are not read (packet ids {shown}); see nev_unmatched_packets."
+            )
 
     def _get_reset_event_mask(self, raw_event_data, masks, spec):
         """

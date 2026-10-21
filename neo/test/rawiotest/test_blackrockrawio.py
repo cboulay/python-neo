@@ -866,6 +866,63 @@ class TestBlackrockRawIO(
         self.assertEqual(len(passes), 1)
         self.assertEqual(streamed, sum(counts))
 
+    def test_nev_packets_of_no_known_type_are_counted_and_warned_about(self):
+        """
+        A data packet that matches no packet type of the file's spec is not read; it is counted by
+        packet id in nev_unmatched_packets, and a warning says so, so the loss is not silent
+        (NeuralEnsemble/python-neo#1918). Shown with a 2.2 NEV whose spikes on electrode 300 match
+        no type when 2.2's spike range is 1-255, as it was before #1918, and with neo's own 3.0
+        test file, which holds packet types neo does not know (32769 and 65529).
+        """
+        import shutil
+        import tempfile
+        import warnings
+        from unittest import mock
+
+        import fsspec
+
+        from neo.rawio import blackrockrawio
+
+        data = bytearray(Path(self.get_local_path("blackrock/FileSpec2.3001") + ".nev").read_bytes())
+        data[9] = 2  # FileSpec 2.3 -> 2.2
+        header_size, packet_size = (int(x) for x in np.frombuffer(bytes(data[12:20]), dtype="<u4"))
+        moved = comments = 0
+        for row in range((len(data) - header_size) // packet_size):
+            at = header_size + row * packet_size + 4  # 2.x: a uint32 timestamp, then the packet id
+            packet_id = int.from_bytes(data[at : at + 2], "little")
+            if packet_id == 1:
+                data[at : at + 2] = (300).to_bytes(2, "little")
+                moved += 1
+            comments += packet_id == 0xFFFF  # a 2.3 type that 2.2 does not have
+        self.assertGreater(moved, 0)
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        base = str(Path(folder) / "trellis_like")
+        Path(base + ".nev").write_bytes(bytes(data))
+        fs = fsspec.filesystem("memory")
+        fs.pipe(f"/unmatched{base}.nev", bytes(data))
+        self.addCleanup(fs.rm, f"/unmatched{base}.nev")
+
+        with mock.patch.dict(blackrockrawio.NEV_PACKET_IDENTIFIERS_BY_SPEC["2.2"], {"Spikes": (1, 255)}):
+            for filename in (base, f"memory:///unmatched{base}"):
+                reader = BlackrockRawIO(filename=filename, nsx_to_load=None)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    reader.parse_header()
+                self.assertEqual(reader.nev_unmatched_packets, {300: moved, 0xFFFF: comments}, filename)
+                self.assertTrue(any("match no packet type" in str(w.message) for w in caught), filename)
+
+        for filename in (base, f"memory:///unmatched{base}"):  # with 2.2's range as it is now
+            reader = BlackrockRawIO(filename=filename, nsx_to_load=None)
+            reader.parse_header()
+            self.assertEqual(reader.nev_unmatched_packets, {0xFFFF: comments})
+
+        spec_3_0 = self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0")
+        for filename in (spec_3_0, "file://" + spec_3_0):
+            reader = BlackrockRawIO(filename=filename, nsx_to_load=None)
+            reader.parse_header()
+            self.assertEqual(reader.nev_unmatched_packets, {32769: 538, 65529: 2}, filename)
+
     def test_timestamp_gap_scan_matches_reader_on_ptp_file(self):
         """
         The piecewise gap scan finds the same gaps the reader finds in a real PTP recording with missing samples.
