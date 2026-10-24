@@ -5,10 +5,8 @@ Tests of neo.rawio.examplerawio
 import tempfile
 import unittest
 import warnings
-
-from pathlib import Path
-
 from unittest import mock
+from pathlib import Path
 
 from neo.rawio.blackrockrawio import BlackrockRawIO
 from neo.test.rawiotest.common_rawio_test import BaseTestRawIO
@@ -468,80 +466,6 @@ class TestBlackrockRawIO(
         got = np.concatenate([reader.get_spike_timestamps(0, 0, i, None, None) for i in units_on_300])
         assert_equal(np.sort(got), np.sort(expected))
 
-    def test_nev_over_4_gib_does_not_overflow(self):
-        """File sizes > 4 GiB must not overflow against the uint32 NEV header fields (NumPy 2, NEP 50)."""
-        file_size = 5 * 2**30
-        basic_header = np.zeros(
-            1, dtype=[("ver_major", "uint8"), ("bytes_in_headers", "uint32"), ("bytes_in_data_packets", "uint32")]
-        )[0]
-        basic_header["ver_major"] = 2
-        basic_header["bytes_in_headers"] = 1000
-        basic_header["bytes_in_data_packets"] = 104
-
-        reader = BlackrockRawIO.__new__(BlackrockRawIO)  # skip parsing real files
-        reader._nev_basic_header = basic_header
-        reader._nev_params = lambda name: basic_header[name]
-        reader._filenames = {"nev": "fake"}
-
-        class Stop(Exception):
-            pass
-
-        with (
-            mock.patch.object(reader, "_get_file_size", return_value=file_size),
-            mock.patch("neo.rawio.blackrockrawio.np.memmap", side_effect=Stop) as memmap,
-        ):
-            with self.assertRaises(Stop):
-                reader._read_nev_data("2.2", "fake.nev")
-            self.assertEqual(memmap.call_args.kwargs["offset"], 1000)
-            self.assertEqual(memmap.call_args.kwargs["shape"], ((file_size - 1000) // 104,))
-
-            with self.assertRaises(Stop):
-                reader._get_nev_rec_times()
-            self.assertEqual(memmap.call_args.kwargs["offset"], file_size - 104)
-
-    def test_buffer_description_matches_chunks(self):
-        """
-        Samples read using only the buffer description match get_analogsignal_chunk,
-        for every segment and stream of the non-PTP test files.
-        """
-        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
-        for entity in test_entities:
-            reader = BlackrockRawIO(filename=self.get_local_path(entity))
-            reader.parse_header()
-            for seg_index in range(reader.segment_count(0)):
-                for stream_index, stream in enumerate(reader.header["signal_streams"]):
-                    buffer_id = stream["buffer_id"]
-                    descr = reader.get_analogsignal_buffer_description(
-                        block_index=0, seg_index=seg_index, buffer_id=buffer_id
-                    )
-                    from_dict = np.memmap(
-                        descr["file_path"],
-                        dtype=descr["dtype"],
-                        mode="r",
-                        offset=descr["file_offset"],
-                        shape=descr["shape"],
-                    )
-                    from_neo = reader.get_analogsignal_chunk(
-                        block_index=0, seg_index=seg_index, stream_index=stream_index
-                    )
-                    assert_equal(from_dict, from_neo)
-
-    def test_buffer_description_refused_for_ptp(self):
-        reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0_ptp/20231027-125608-001"))
-        reader.parse_header()
-
-        self.assertFalse(reader.has_buffer_description_api())
-        buffer_id = reader.header["signal_buffers"]["id"][0]
-        with self.assertRaises(ValueError):
-            reader.get_analogsignal_buffer_description(block_index=0, seg_index=0, buffer_id=buffer_id)
-
-    def test_header_from_memory_url_matches_local(self):
-        """
-        Test opening a recording by memory:// URL gives the same header as opening it locally.
-        """
-
-    def _open_local_and_from_memory(self, entity, **kwargs):
-
     def _open_local_and_from_memory(self, entity, nev_packets_per_piece=None, **kwargs):
         """Open a recording locally and, after copying its files into fsspec's memory filesystem, by memory:// URL."""
         import fsspec
@@ -952,6 +876,74 @@ class TestBlackrockRawIO(
                     packets_per_piece=16,  # small, so several gaps fall near piece boundaries
                 )
             assert_equal(gaps["indices"], expected)
+
+    def test_buffer_description_matches_chunks(self):
+        """
+        Samples read using only the buffer description match get_analogsignal_chunk,
+        for every segment and stream of the non-PTP test files.
+        """
+        test_entities = [entity for entity in self.entities_to_test if "ptp" not in entity.lower()]
+        for entity in test_entities:
+            reader = BlackrockRawIO(filename=self.get_local_path(entity))
+            reader.parse_header()
+            for seg_index in range(reader.segment_count(0)):
+                for stream_index, stream in enumerate(reader.header["signal_streams"]):
+                    buffer_id = stream["buffer_id"]
+                    descr = reader.get_analogsignal_buffer_description(
+                        block_index=0, seg_index=seg_index, buffer_id=buffer_id
+                    )
+                    from_dict = np.memmap(
+                        descr["file_path"],
+                        dtype=descr["dtype"],
+                        mode="r",
+                        offset=descr["file_offset"],
+                        shape=descr["shape"],
+                    )
+                    from_neo = reader.get_analogsignal_chunk(
+                        block_index=0, seg_index=seg_index, stream_index=stream_index
+                    )
+                    assert_equal(from_dict, from_neo)
+
+    def test_buffer_description_refused_for_ptp(self):
+        reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0_ptp/20231027-125608-001"))
+        reader.parse_header()
+
+        self.assertFalse(reader.has_buffer_description_api())
+        buffer_id = reader.header["signal_buffers"]["id"][0]
+        with self.assertRaises(ValueError):
+            reader.get_analogsignal_buffer_description(block_index=0, seg_index=0, buffer_id=buffer_id)
+
+    def test_nev_over_4_gib_does_not_overflow(self):
+        """File sizes > 4 GiB must not overflow against the uint32 NEV header fields (NumPy 2, NEP 50)."""
+        file_size = 5 * 2**30
+        basic_header = np.zeros(
+            1, dtype=[("ver_major", "uint8"), ("bytes_in_headers", "uint32"), ("bytes_in_data_packets", "uint32")]
+        )[0]
+        basic_header["ver_major"] = 2
+        basic_header["bytes_in_headers"] = 1000
+        basic_header["bytes_in_data_packets"] = 104
+
+        reader = BlackrockRawIO.__new__(BlackrockRawIO)  # skip parsing real files
+        reader._nev_basic_header = basic_header
+        reader._nev_params = lambda name: basic_header[name]
+        reader._filenames = {"nev": "fake"}
+        reader._fs = None  # local file: memory-mapped
+
+        class Stop(Exception):
+            pass
+
+        with (
+            mock.patch.object(reader, "_get_file_size", return_value=file_size),
+            mock.patch("neo.rawio.blackrockrawio.np.memmap", side_effect=Stop) as memmap,
+        ):
+            with self.assertRaises(Stop):
+                reader._read_nev_data("2.2", "fake.nev")
+            self.assertEqual(memmap.call_args.kwargs["offset"], 1000)
+            self.assertEqual(memmap.call_args.kwargs["shape"], ((file_size - 1000) // 104,))
+
+            with self.assertRaises(Stop):
+                reader._get_nev_rec_times()
+            self.assertEqual(memmap.call_args.kwargs["offset"], file_size - 104)
 
 
 if __name__ == "__main__":
