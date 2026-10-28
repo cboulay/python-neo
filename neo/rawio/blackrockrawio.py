@@ -1947,7 +1947,9 @@ class BlackrockRawIO(BaseRawIO):
         last packet of the same type since the segment began: a clock reset sends every packet
         type's clock back. Packets of different types are not compared: the format does not
         order them, and comments can be stamped a few ms after the spikes written after them,
-        which compared across types looked like a reset each time. `state` carries the last
+        which compared across types looked like a reset each time. Comments are not compared at all:
+        they are not in time order among themselves either, so a comment gets the segment of the
+        packets around it in the file (a reset comment still starts one). `state` carries the last
         timestamp and position of each type, and the boundaries so far, from piece to piece.
         """
         n = len(raw)
@@ -1961,7 +1963,7 @@ class BlackrockRawIO(BaseRawIO):
         candidates = []  # (position, position compared with, is a reset comment)
         for data_type, mask in masks.items():
             pos = np.flatnonzero(mask)
-            if len(pos) == 0:
+            if len(pos) == 0 or data_type == "Comments":
                 continue
             ts = raw["timestamp"][pos]
             if data_type in state["last"]:

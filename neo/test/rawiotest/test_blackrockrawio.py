@@ -402,6 +402,28 @@ class TestBlackrockRawIO(
             self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
             self.assertEqual(len(caught), max(expected))  # one warning for the reset without a reset comment
 
+    def test_nev_comments_out_of_order_do_not_split_segments(self):
+        """
+        Comments are not in time order among themselves either: one is stamped when its event starts and
+        written when its text is built, so a comment can be written after a later-stamped one. Comments
+        never start a segment (except a reset comment); the spikes' clock decides.
+        """
+        spike, comment = 1, 0xFFFF
+        # The second comment is earlier than the first.
+        packets = [(1000, spike), (1004, comment), (1001, spike), (1002, comment), (1003, spike)]
+        # A reset sends the spikes' clock back; the comment written after it is in the new segment.
+        reset = [(5, spike), (3, comment), (6, spike)]
+        reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0"))  # not parsed
+        for packets, expected in ((packets, [0] * 5), (packets + reset, [0] * 5 + [1] * 3)):
+            raw = np.array(
+                [(*p, b"") for p in packets], dtype=[("timestamp", "uint64"), ("packet_id", "uint16"), ("value", "S2")]
+            )
+            masks = {"Spikes": raw["packet_id"] == spike, "Comments": raw["packet_id"] == comment}
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                assert_equal(reader._get_event_segment_ids(raw, masks, "3.0"), expected)
+            self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
+
     def test_nev_spikes_at_segment_edges_ptp(self):
         """
         With 1 ns timestamps (PTP files), converting the segment bounds to ticks or comparing uint64 with
@@ -667,9 +689,9 @@ class TestBlackrockRawIO(
         """
         Write a FileSpec 3.0 NEV (from neo's file_spec_3_0.nev) with a comment after every `every`
         spikes, stamped `ahead_ns` after the spike before it, so it is later than the spikes that
-        follow. With `reset_after`, every packet after that many spikes has its clock reset to
+        follow (a tuple of `ahead_ns` is used in turn, comment by comment). With `reset_after`, every packet after that many spikes has its clock reset to
         near zero, as a real reset does. Returns the base name, the spikes before the reset and
-        after it, and the number of comments.
+        after it, and the comments' timestamps.
         """
         source = Path(self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0") + ".nev").read_bytes()
         header_size, packet_size = np.frombuffer(source[12:20], dtype="<u4")
@@ -680,7 +702,8 @@ class TestBlackrockRawIO(
         comment["packet_id"] = 0xFFFF
         comment["rest"] = b"\x00\x00\x00\x00\x00\x00note"  # char_set 0, flag 0, color 0, then the text
 
-        out, before, after, comments = [], 0, 0, 0
+        out, before, after, comments = [], 0, 0, []
+        aheads = np.atleast_1d(ahead_ns)
         shift = 0
         for i, packet in enumerate(packets):
             if reset_after is not None and i == reset_after:
@@ -694,9 +717,9 @@ class TestBlackrockRawIO(
                 after += 1
             if (i + 1) % every == 0:
                 note = comment.copy()
-                note["timestamp"] = spike["timestamp"] + ahead_ns
+                note["timestamp"] = spike["timestamp"] + aheads[len(comments) % len(aheads)]
                 out.append(note.tobytes())
-                comments += 1
+                comments.append(int(note["timestamp"][0]))
         base = str(Path(folder) / "rec")
         Path(base + ".nev").write_bytes(source[:header_size] + b"".join(out))
         return base, before, after, comments
@@ -732,12 +755,34 @@ class TestBlackrockRawIO(
         folder = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, folder)
         base, spikes, _, comments = self._nev_with_comments(folder, every=50, ahead_ns=3_000_000)
-        self.assertGreater(comments, 5)
+        self.assertGreater(len(comments), 5)
         for reader in self._open_nev_locally_and_from_memory(base):
             self.assertEqual(reader.segment_count(0), 1)
             self.assertEqual(self._spikes_per_segment(reader), [spikes])
             comment_channel = list(reader.header["event_channels"]["name"]).index("comments")
-            self.assertEqual(reader.event_count(0, 0, comment_channel), comments)
+            self.assertEqual(reader.event_count(0, 0, comment_channel), len(comments))
+
+    def test_comments_out_of_order_among_themselves_do_not_split_segments(self):
+        """
+        A comment written after one stamped later than it (each is stamped when its event starts and
+        written when its text is built) is not a clock reset either: comments never start a segment.
+        Every comment is still read, with its own timestamp.
+        """
+        import shutil
+        import tempfile
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        # At 30 kHz, comments 4 ms and 1 ms ahead in turn, one after every spike: where two spikes are
+        # closer than 3 ms, the second comment is earlier than the first.
+        base, spikes, _, comments = self._nev_with_comments(folder, every=1, ahead_ns=(120, 30))
+        self.assertTrue(np.any(np.diff(comments) < 0))
+        for reader in self._open_nev_locally_and_from_memory(base):
+            self.assertEqual(reader.segment_count(0), 1)
+            self.assertEqual(self._spikes_per_segment(reader), [spikes])
+            comment_channel = list(reader.header["event_channels"]["name"]).index("comments")
+            timestamps, _, _ = reader.get_event_timestamps(0, 0, comment_channel, None, None)
+            assert_equal(timestamps, comments)
 
     def test_real_reset_among_comments_is_one_boundary(self):
         """
