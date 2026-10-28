@@ -180,9 +180,10 @@ def find_timestamp_gaps_in_opened_file(
         `np.flatnonzero(np.diff(...) > threshold_s)` would give);
         "sizes_s": each gap's size in seconds;
         "before_s": the timestamp before each gap, in seconds;
-        "first_s": the first timestamp in seconds, or None if there are none.
+        "first_s": the first timestamp in seconds, or None if there are none;
+        "steps_back": the index of each timestamp followed by an earlier one.
     """
-    indices, sizes, before = [], [], []
+    indices, sizes, before, back = [], [], [], []
     first_s = None
     last_s = None
     for start in range(0, num_packets, packets_per_piece):
@@ -202,6 +203,7 @@ def find_timestamp_gaps_in_opened_file(
         indices.append(found + base)
         sizes.append(diffs[found])
         before.append(joined[found])
+        back.append(np.flatnonzero(diffs < 0) + base)
         last_s = seconds[-1]
 
     def _join(parts, dtype):
@@ -212,4 +214,5 @@ def find_timestamp_gaps_in_opened_file(
         "sizes_s": _join(sizes, np.float64),
         "before_s": _join(before, np.float64),
         "first_s": first_s,
+        "steps_back": _join(back, np.int64),
     }
