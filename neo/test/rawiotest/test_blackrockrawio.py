@@ -399,6 +399,28 @@ class TestBlackrockRawIO(
             self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
             self.assertEqual(len(caught), max(expected))  # one warning for the reset without a reset comment
 
+    def test_nev_comments_out_of_order_do_not_split_segments(self):
+        """
+        Comments are not in time order among themselves either: one is stamped when its event starts and
+        written when its text is built, so a comment can be written after a later-stamped one. Comments
+        never start a segment (except a reset comment); the spikes' clock decides.
+        """
+        spike, comment = 1, 0xFFFF
+        # The second comment is earlier than the first.
+        packets = [(1000, spike), (1004, comment), (1001, spike), (1002, comment), (1003, spike)]
+        # A reset sends the spikes' clock back; the comment written after it is in the new segment.
+        reset = [(5, spike), (3, comment), (6, spike)]
+        reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0"))  # not parsed
+        for packets, expected in ((packets, [0] * 5), (packets + reset, [0] * 5 + [1] * 3)):
+            raw = np.array(
+                [(*p, b"") for p in packets], dtype=[("timestamp", "uint64"), ("packet_id", "uint16"), ("value", "S2")]
+            )
+            masks = {"Spikes": raw["packet_id"] == spike, "Comments": raw["packet_id"] == comment}
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                assert_equal(reader._get_event_segment_ids(raw, masks, "3.0"), expected)
+            self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
+
 
 if __name__ == "__main__":
     unittest.main()
