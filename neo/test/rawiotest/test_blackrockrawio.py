@@ -2,8 +2,11 @@
 Tests of neo.rawio.examplerawio
 """
 
+import shutil
+import tempfile
 import unittest
 import warnings
+from pathlib import Path
 
 from neo.rawio.blackrockrawio import BlackrockRawIO
 from neo.test.rawiotest.common_rawio_test import BaseTestRawIO
@@ -267,81 +270,111 @@ class TestBlackrockRawIO(
         expected_ns6 = ptp_clock_ns_ns6.astype("float64") / nanoseconds_per_second
         np.testing.assert_array_equal(timestamps_ns6[:5], expected_ns6)
 
-    def test_get_blackrock_timestamps_ptp_with_gaps(self):
-        """Test _get_blackrock_timestamps for PTP format with gaps and multiple segments."""
-        dirname = self.get_local_path("blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes")
-        gap_tolerance_ms = 0.5
-        reader = BlackrockRawIO(filename=dirname, nsx_to_load=6, gap_tolerance_ms=gap_tolerance_ms)
-        reader.parse_header()
+    PTP_ENTITY = "blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes"
 
-        n_segments = reader.segment_count(0)
-        self.assertEqual(n_segments, 3)
+    def _ptp_packets(self, nsx_nb):
+        """
+        (headers, packets) of ns{nsx_nb} of PTP_ENTITY: the header bytes, and the packets (one
+        sample each) as rows of bytes, sorted by timestamp, which puts them on an even grid.
+        """
+        raw = Path(self.get_local_path(self.PTP_ENTITY) + f".ns{nsx_nb}").read_bytes()
+        header_size = int.from_bytes(raw[10:14], "little")
+        channels = int.from_bytes(raw[310:314], "little")
+        packets = np.frombuffer(raw, np.uint8, offset=header_size).reshape(-1, 13 + 2 * channels)
+        ticks = packets[:, 1:9].copy().view("<u8").ravel()
+        return raw[:header_size], packets[np.argsort(ticks, kind="stable")]
 
-        nanoseconds_per_second = 1_000_000_000.0
+    @staticmethod
+    def _ticks_and_samples(packets):
+        return packets[:, 1:9].copy().view("<u8").ravel(), packets[:, 13:].copy().view("<i2")
 
-        # This file has a single stream: ns6 (30 kHz, 1 channel)
-        stream_index = 0
-        expected_sizes = [632, 58, 310]
+    @staticmethod
+    def _written_ahead(order, at, by):
+        """`order` with the packet `by` places after `at` written at `at`, the ones between one place later."""
+        order = np.array(order)
+        order[at : at + by + 1] = np.r_[order[at + by], order[at : at + by]]
+        return order
 
-        # First 5 PTP clock values (nanoseconds since Unix epoch) per segment, read directly from file and hardcoded here for testing
-        first_5_ptp_clock_ns_per_segment = [
-            np.array(
-                [
-                    1752531864717743037,
-                    1752531864717776237,
-                    1752531864717809677,
-                    1752531864717843077,
-                    1752531864717876277,
-                ],
-                dtype="uint64",
-            ),
-            np.array(
-                [
-                    1752531864739742985,
-                    1752531864739776305,
-                    1752531864739809665,
-                    1752531864739842945,
-                    1752531864739876385,
-                ],
-                dtype="uint64",
-            ),
-            np.array(
-                [
-                    1752531864740742986,
-                    1752531864740776306,
-                    1752531864740809626,
-                    1752531864740842946,
-                    1752531864740876346,
-                ],
-                dtype="uint64",
-            ),
-        ]
-        # Last PTP clock value (nanoseconds since Unix epoch) of each segment, hardcoded here for testing
-        last_ptp_clock_ns_per_segment = np.array(
-            [1752531864738776304, 1752531864739709625, 1752531864751042999],
-            dtype="uint64",
-        )
+    def _write_ptp_recording(self, folder, nsx_nb, order):
+        """A copy of PTP_ENTITY's ns{nsx_nb} with its sorted packets written in `order` (and its .nev as is)."""
+        headers, packets = self._ptp_packets(nsx_nb)
+        base = str(Path(folder) / "rec")
+        Path(base + f".ns{nsx_nb}").write_bytes(headers + packets[order].tobytes())
+        shutil.copy(self.get_local_path(self.PTP_ENTITY) + ".nev", base + ".nev")
+        return base
 
-        for seg_index in range(n_segments):
-            timestamps = reader._get_blackrock_timestamps(0, seg_index, None, None, stream_index)
-            self.assertEqual(timestamps.shape[0], expected_sizes[seg_index])
-
-            # Verify first 5 timestamps match the clock values from the file
-            expected_first_5 = first_5_ptp_clock_ns_per_segment[seg_index].astype("float64") / nanoseconds_per_second
-            np.testing.assert_array_equal(timestamps[:5], expected_first_5)
-
-            # Verify last timestamp
-            expected_last = last_ptp_clock_ns_per_segment[seg_index].astype("float64") / nanoseconds_per_second
-            np.testing.assert_array_equal(timestamps[-1], expected_last)
-
-        # Verify the gaps between segments exceed the tolerance
-        for seg_index in range(n_segments - 1):
-            last_ts = last_ptp_clock_ns_per_segment[seg_index].astype("float64") / nanoseconds_per_second
-            first_ts_next = (
-                first_5_ptp_clock_ns_per_segment[seg_index + 1][0].astype("float64") / nanoseconds_per_second
+    def test_ptp_file_with_missing_samples_has_its_packets_out_of_order(self):
+        """
+        The test file "with missing samples" misses none: its ns4 and ns6 have every sample, some written
+        out of order (a run of 10 or 30 written after the next run), and its NEV has 3 spikes written after
+        later ones. Read in timestamp order, each stream is one segment on an even grid.
+        """
+        reader = BlackrockRawIO(filename=self.get_local_path(self.PTP_ENTITY), gap_tolerance_ms=0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            reader.parse_header()
+        self.assertEqual(reader.segment_count(0), 1)
+        self.assertEqual(reader.nsx_reordered_packets, {4: 2, 6: 1})
+        self.assertEqual(reader.nev_reordered_packets, 3)
+        self.assertEqual(sum("read in timestamp order" in str(w.message) for w in caught), 2)  # one per nsX
+        self.assertEqual(sum("nev_reordered_packets" in str(w.message) for w in caught), 1)
+        for stream_index, nsx_nb in enumerate((4, 6)):
+            _, packets = self._ptp_packets(nsx_nb)
+            ticks, samples = self._ticks_and_samples(packets)
+            self.assertEqual(len(np.unique(np.round(np.diff(ticks) / np.median(np.diff(ticks))))), 1)  # a grid
+            assert_equal(reader.get_analogsignal_chunk(0, 0, None, None, stream_index), samples)
+            assert_equal(reader._get_blackrock_timestamps(0, 0, None, None, stream_index), ticks / 1e9)
+        for unit_index in range(reader.spike_channels_count()):
+            self.assertTrue(
+                np.all(np.diff(reader.get_spike_timestamps(0, 0, unit_index, None, None).astype(float)) >= 0)
             )
-            gap_ms = (first_ts_next - last_ts) * 1000
-            self.assertGreater(gap_ms, gap_tolerance_ms)
+
+    def test_nsx_packets_written_out_of_order_are_read_in_timestamp_order(self):
+        """
+        A PTP .nsX packet written up to 10 ms before packets stamped earlier is read in its place: no gap
+        and no new segment where it was written, and the samples and timestamps come in timestamp order,
+        whole and in windows that start or end inside the reordered run.
+        """
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        _, packets = self._ptp_packets(6)
+        ticks, samples = self._ticks_and_samples(packets)
+        # 51 places ahead (1.7 ms at 30 kHz, 52 samples of "gap" as written), and 2 places ahead.
+        order = self._written_ahead(self._written_ahead(np.arange(len(packets)), 200, 51), 500, 2)
+        base = self._write_ptp_recording(folder, 6, order)
+        reader = BlackrockRawIO(filename=base, nsx_to_load=6, load_nev=False, gap_tolerance_ms=1.0)
+        reader.parse_header()
+        self.assertEqual(reader.segment_count(0), 1)
+        self.assertEqual(reader.nsx_reordered_packets, {6: 2})
+        for i_start, i_stop in ((None, None), (0, 210), (220, 260), (190, 501), (501, 600)):
+            window = slice(i_start, i_stop)
+            assert_equal(reader.get_analogsignal_chunk(0, 0, i_start, i_stop, 0), samples[window])
+            assert_equal(reader._get_blackrock_timestamps(0, 0, i_start, i_stop, 0), ticks[window] / 1e9)
+
+    def test_nsx_steps_back_that_do_not_sort_cleanly_are_left_as_they_are(self):
+        """
+        A step back that sorting does not turn into an even grid within 10 ms is not reordered: a packet
+        written 400 places (13 ms) ahead still makes a gap, and a packet written twice stays where it is.
+        """
+        n = len(self._ptp_packets(6)[1])
+        too_far = self._written_ahead(np.arange(n), 100, 400)
+        written_twice = np.r_[np.arange(500), 498, np.arange(500, n)]
+        for order, segments in ((too_far, 2), (written_twice, 1)):
+            folder = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, folder)
+            base = self._write_ptp_recording(folder, 6, order)
+            reader = BlackrockRawIO(filename=base, nsx_to_load=6, load_nev=False, gap_tolerance_ms=1.0)
+            reader.parse_header()
+            self.assertEqual(reader.segment_count(0), segments)
+            self.assertEqual(reader.nsx_reordered_packets, {6: 0})
+            ticks, samples = self._ticks_and_samples(self._ptp_packets(6)[1][order])
+            chunks = [reader.get_analogsignal_chunk(0, seg, None, None, 0) for seg in range(segments)]
+            assert_equal(np.concatenate(chunks), samples)  # in file order
+
+    def _write_ptp_recording_with_gaps(self, folder):
+        """PTP_ENTITY's ns6 in timestamp order, without 21 samples (a 0.73 ms gap) and 150 (a 5 ms gap)."""
+        n = len(self._ptp_packets(6)[1])
+        return self._write_ptp_recording(folder, 6, np.r_[0:300, 321:600, 750:n])
 
     def test_gap_tolerance_ms_parameter(self):
         """
@@ -349,11 +382,10 @@ class TestBlackrockRawIO(
 
         Tests the error-by-default behavior where files with timestamp gaps raise ValueError
         unless the user explicitly opts in with gap_tolerance_ms parameter.
-
-        See PR #1769 for the gap details on the example file used here.
         """
-        # Use stubbed files with missing samples (timestamp gaps) from SimulatedSpikes data
-        dirname = self.get_local_path("blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes")
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        dirname = self._write_ptp_recording_with_gaps(folder)
 
         # Test 1: Default behavior (None) raises ValueError for files with gaps
         # This is the error-by-default behavior to ensure users are aware of data issues
@@ -372,8 +404,8 @@ class TestBlackrockRawIO(
         # With strict tolerance (0.5ms), gaps > 0.5ms will create new segments
         reader_strict = BlackrockRawIO(filename=dirname, nsx_to_load=6, gap_tolerance_ms=0.5)
         reader_strict.parse_header()
-        segments_strict = reader_strict.segment_count(0)
-        self.assertEqual(segments_strict, 3)  #
+        self.assertEqual(reader_strict.segment_count(0), 3)
+        self.assertEqual([reader_strict.get_signal_size(0, k, 0) for k in range(3)], [300, 279, 250])
 
     def test_nev_segments_ignore_order_between_packet_types(self):
         """
@@ -387,6 +419,7 @@ class TestBlackrockRawIO(
         # A reset sends the clock of every packet type back.
         reset = [(5, spike), (7, comment), (6, spike)]
         reader = BlackrockRawIO(filename=self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0"))  # not parsed
+        reader._nev_basic_header = {"timestamp_resolution": 30_000}  # the resets are > 10 ms (300 ticks) back
         for packets, expected in ((no_reset, [0] * 6), (no_reset + reset, [0] * 6 + [1] * 3)):
             raw = np.array(
                 [(*p, b"") for p in packets], dtype=[("timestamp", "uint64"), ("packet_id", "uint16"), ("value", "S2")]
@@ -398,6 +431,140 @@ class TestBlackrockRawIO(
             assert_equal(segment_ids, expected)
             self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
             self.assertEqual(len(caught), max(expected))  # one warning for the reset without a reset comment
+
+    def _nev_spikes_written(self, folder, name, order, shift_from=None, shift=0):
+        """
+        The spikes of neo's file_spec_3_0.nev (30 kHz clock, so 10 ms is 300 ticks) written in `order`,
+        those from position `shift_from` on (in the order written) stamped `shift` ticks earlier.
+        Returns the base name and the timestamps as written.
+        """
+        source = Path(self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0") + ".nev").read_bytes()
+        header_size, packet_size = np.frombuffer(source[12:20], dtype="<u4")
+        dtype = np.dtype([("timestamp", "<u8"), ("packet_id", "<u2"), ("rest", f"S{packet_size - 10}")])
+        packets = np.frombuffer(source[header_size:], dtype=dtype)
+        packets = packets[(packets["packet_id"] >= 1) & (packets["packet_id"] <= 2048)][order]
+        if shift_from is not None:
+            packets["timestamp"][shift_from:] -= np.uint64(shift)
+        base = str(Path(folder) / name)
+        Path(base + ".nev").write_bytes(source[:header_size] + packets.tobytes())
+        return base, packets["timestamp"]
+
+    def _file_spec_3_0_spike_times(self):
+        source = Path(self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0") + ".nev").read_bytes()
+        header_size, packet_size = np.frombuffer(source[12:20], dtype="<u4")
+        dtype = np.dtype([("timestamp", "<u8"), ("packet_id", "<u2"), ("rest", f"S{packet_size - 10}")])
+        packets = np.frombuffer(source[header_size:], dtype=dtype)
+        spikes = packets[(packets["packet_id"] >= 1) & (packets["packet_id"] <= 2048)]
+        return spikes["timestamp"].astype(np.int64), spikes["packet_id"]
+
+    def _assert_same_spikes_and_events(self, expected, reader):
+        """Every unit and event channel gives the same times, waveforms and labels in every segment."""
+        self.assertEqual(reader.segment_count(0), expected.segment_count(0))
+        for seg_index in range(expected.segment_count(0)):
+            for unit_index in range(expected.spike_channels_count()):
+                assert_equal(
+                    reader.get_spike_timestamps(0, seg_index, unit_index, None, None),
+                    expected.get_spike_timestamps(0, seg_index, unit_index, None, None),
+                )
+                assert_equal(
+                    reader.get_spike_raw_waveforms(0, seg_index, unit_index, None, None),
+                    expected.get_spike_raw_waveforms(0, seg_index, unit_index, None, None),
+                )
+            for event_index in range(expected.event_channels_count()):
+                times, _, labels = reader.get_event_timestamps(0, seg_index, event_index, None, None)
+                expected_times, _, expected_labels = expected.get_event_timestamps(
+                    0, seg_index, event_index, None, None
+                )
+                assert_equal(times, expected_times)
+                assert_equal(labels, expected_labels)
+
+    def test_nev_spikes_written_late_are_not_resets(self):
+        """
+        A spike written after spikes stamped up to 10 ms later than it (as when the recording PC receives
+        datagrams out of order) is not a clock reset: no segment starts there, every spike is kept, and
+        each unit's spikes come in timestamp order, as from the file written in order.
+        """
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        ts, electrodes = self._file_spec_3_0_spike_times()
+        order = np.arange(len(ts))
+        # a spike written after the next spike on its own electrode, 292 ticks (9.7 ms) later
+        same = np.flatnonzero(electrodes == 1)
+        k = int(np.argmin(np.diff(ts[same])))
+        first, second = int(same[k]), int(same[k + 1])
+        self.assertLessEqual(ts[second] - ts[first], 300)
+        order = np.r_[order[:first], order[first + 1 : second + 1], order[first], order[second + 1 :]]
+        # and, before it, a spike written after the (two or more) spikes up to 250 ticks (8.3 ms) later
+        last = np.searchsorted(ts, ts + 250, side="right") - 1
+        candidates = (last > np.arange(len(ts)) + 1) & (ts < np.r_[ts[1:], 0]) & (last < first)
+        k = int(np.flatnonzero(candidates)[0])
+        order = np.r_[order[:k], order[k + 1 : last[k] + 1], order[k], order[last[k] + 1 :]]
+
+        in_order, _ = self._nev_spikes_written(folder, "in_order", np.arange(len(ts)))
+        expected = BlackrockRawIO(filename=in_order)
+        expected.parse_header()
+        base, _ = self._nev_spikes_written(folder, "late", order)
+        reader = BlackrockRawIO(filename=base)
+        reader.parse_header()
+        self.assertEqual(reader.segment_count(0), 1)
+        self.assertEqual(reader.nev_reordered_packets, 2)
+        self._assert_same_spikes_and_events(expected, reader)
+
+    def test_nev_step_back_over_10_ms_is_a_reset(self):
+        """A spike stamped more than 10 ms before the spike written before it still starts a segment."""
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        ts, _ = self._file_spec_3_0_spike_times()
+        for back, segments in ((301, 2), (300, 1)):
+            shift = int(ts[400] - ts[399]) + back
+            base, written = self._nev_spikes_written(folder, f"back{back}", np.arange(len(ts)), 400, shift)
+            self.assertEqual(int(written[399]) - int(written[400]), back)
+            reader = BlackrockRawIO(filename=base)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                reader.parse_header()
+            self.assertEqual(reader.segment_count(0), segments)
+            self.assertEqual(reader.nev_reordered_packets, 2 - segments)
+
+    REORDERED_ENTITY = "blackrock/blackrock_ptp_reordered"
+
+    def test_reordered_recording_reads_as_the_original(self):
+        """
+        A PTP recording from a Gemini Hub and NSP (signal generator; a pause and a button press), and the
+        same files with packets moved out of order as the recording PC was seen to write them: Hub1 ns5 two
+        samples 51 places early, NSP ns5 one sample 2 places early, Hub1 NEV four spikes written after spikes
+        up to 2.6 ms later and one after the next spike on its own electrode (9.7 ms). Sorting each file by
+        timestamp gives back the original. Both read the same: segments, samples, timestamps, spikes, events.
+        """
+        folder = Path(self.get_local_path(self.REORDERED_ENTITY))
+        if not folder.exists():
+            self.skipTest(f"{folder} is not available")
+        for device, nsx, nev in (("Hub1", {5: 2}, 5), ("NSP", {5: 1}, 0)):
+            original = BlackrockRawIO(
+                filename=str(folder / "datafile001" / f"{device}-datafile001"), gap_tolerance_ms=1
+            )
+            original.parse_header()
+            self.assertEqual(original.nsx_reordered_packets, {5: 0})
+            self.assertEqual(original.segment_count(0), 2)  # the pause
+            reordered = BlackrockRawIO(
+                filename=str(folder / "datafile001_reordered" / f"{device}-datafile001"), gap_tolerance_ms=1
+            )
+            reordered.parse_header()
+            self.assertEqual(reordered.nsx_reordered_packets, nsx)
+            self.assertEqual(reordered.nev_reordered_packets, nev)
+            assert_equal(reordered.header, original.header)
+            for seg_index in range(original.segment_count(0)):
+                self.assertEqual(reordered.segment_t_start(0, seg_index), original.segment_t_start(0, seg_index))
+                self.assertEqual(reordered.segment_t_stop(0, seg_index), original.segment_t_stop(0, seg_index))
+                assert_equal(
+                    reordered.get_analogsignal_chunk(0, seg_index, None, None, 0),
+                    original.get_analogsignal_chunk(0, seg_index, None, None, 0),
+                )
+                assert_equal(
+                    reordered._get_blackrock_timestamps(0, seg_index, None, None, 0),
+                    original._get_blackrock_timestamps(0, seg_index, None, None, 0),
+                )
+            self._assert_same_spikes_and_events(original, reordered)
 
 
 if __name__ == "__main__":
