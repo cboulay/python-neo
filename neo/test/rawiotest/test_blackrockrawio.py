@@ -895,6 +895,325 @@ class TestBlackrockRawIO(
                 )
             self._assert_same_spikes_and_events(original, reordered)
 
+    # Remote reading (fsspec URLs), fork only: python-neo#1931
+
+    def _open_local_and_from_memory(self, entity, nev_packets_per_piece=None, local_base=None, **kwargs):
+        """Open a recording locally and, after copying its files into fsspec's memory filesystem, by memory:// URL."""
+        import fsspec
+
+        fs = fsspec.filesystem("memory")
+        local_base = local_base or self.get_local_path(entity)
+        for ext in [".ns1", ".ns2", ".ns3", ".ns4", ".ns5", ".ns6", ".nev"]:
+            local_file = Path(local_base + ext)
+            if local_file.exists() and not fs.exists(f"/{entity}{ext}"):
+                fs.pipe(f"/{entity}{ext}", local_file.read_bytes())
+                self.addCleanup(fs.rm, f"/{entity}{ext}")
+        local = BlackrockRawIO(filename=local_base, **kwargs)
+        local.parse_header()
+        remote = BlackrockRawIO(filename=f"memory:///{entity}", **kwargs)
+        if nev_packets_per_piece:
+            remote._nev_packets_per_piece = nev_packets_per_piece
+        remote.parse_header()
+        # Tiny pieces test the open-time scan across piece boundaries; the per-unit reads after
+        # it use the same code, so larger pieces keep the tests fast.
+        remote._nev_packets_per_piece = 4096
+        return local, remote
+
+    def _assert_same_signals(self, local, remote):
+        """Every segment and stream gives the same samples, and for PTP the same timestamps, whole and in part."""
+        for seg_index in range(local.segment_count(0)):
+            for stream_index in range(local.signal_streams_count()):
+                size = local.get_signal_size(0, seg_index, stream_index)
+                # A window in the middle, so a remote read that ignored i_start would differ.
+                window = dict(i_start=size // 3, i_stop=min(size, size // 3 + 100))
+                for kw in ({}, window):
+                    assert_equal(
+                        remote.get_analogsignal_chunk(seg_index=seg_index, stream_index=stream_index, **kw),
+                        local.get_analogsignal_chunk(seg_index=seg_index, stream_index=stream_index, **kw),
+                    )
+                    i_start, i_stop = kw.get("i_start"), kw.get("i_stop")
+                    assert_equal(
+                        remote._get_blackrock_timestamps(0, seg_index, i_start, i_stop, stream_index),
+                        local._get_blackrock_timestamps(0, seg_index, i_start, i_stop, stream_index),
+                    )
+
+    def test_header_from_memory_url_matches_local(self):
+        """
+        Opening a recording by memory:// URL gives the same header as opening it locally, PTP included.
+        """
+        for entity in self.entities_to_test:
+            local, remote = self._open_local_and_from_memory(entity)
+            assert_equal(remote.header, local.header)
+
+    def test_chunks_from_memory_url_match_local(self):
+        """
+        Chunks and timestamps read from a memory:// URL match the same reads done locally, PTP included.
+        """
+        for entity in self.entities_to_test:
+            local, remote = self._open_local_and_from_memory(entity)
+            self._assert_same_signals(local, remote)
+
+    def test_ptp_with_gaps_from_memory_url_matches_local(self):
+        """
+        A PTP recording with missing samples is segmented at the same gaps, and reads the same, from a memory:// URL.
+
+        Locally the gaps come from the whole timestamp array at once; remotely from a scan in pieces.
+        """
+        import shutil
+        import tempfile
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        n = len(self._ptp_packets(6)[1])
+        # Two gaps, and a packet written out of order in each segment.
+        order = self._written_ahead(self._written_ahead(np.r_[0:300, 321:600, 750:n], 100, 51), 400, 3)
+        local_base = self._write_ptp_recording(folder, 6, order)
+        entity = local_base.lstrip("/")
+        local, remote = self._open_local_and_from_memory(
+            entity, local_base=local_base, nev_packets_per_piece=7, nsx_to_load=6, gap_tolerance_ms=0
+        )
+        self.assertEqual(local.segment_count(0), 3)  # the gaps really split it
+        self.assertEqual(remote.nsx_reordered_packets, {6: 2})
+        assert_equal(remote.header, local.header)
+        self._assert_same_signals(local, remote)
+        self._assert_same_spikes_and_events(local, remote)
+
+        # Without a tolerance both must refuse, with the same gap report.
+        with self.assertRaises(ValueError) as local_error:
+            BlackrockRawIO(filename=local_base, nsx_to_load=6).parse_header()
+        with self.assertRaises(ValueError) as remote_error:
+            BlackrockRawIO(filename=f"memory:///{entity}", nsx_to_load=6).parse_header()
+        self.assertEqual(str(remote_error.exception), str(local_error.exception))
+
+    def test_merged_blocks_from_memory_url_match_local(self):
+        """A segment that merges several data blocks (gap_tolerance_ms) reads the same from a memory:// URL."""
+        local, remote = self._open_local_and_from_memory(
+            "blackrock/segment/PauseCorrect/pause_correct", nsx_to_load=2, gap_tolerance_ms=1e9
+        )
+        self.assertGreater(len(local._nsx_data_header[2][0]["memmap_specs"]), 1)  # really merged
+        assert_equal(remote.header, local.header)
+        self._assert_same_signals(local, remote)
+
+    nev_entities = [
+        "blackrock/FileSpec2.3001",
+        "blackrock/blackrock_2_1/l101210-001",
+        "blackrock/blackrock_3_0/file_spec_3_0",
+        "blackrock/blackrock_3_0_ptp/20231027-125608-001",
+        "blackrock/segment/PauseCorrect/pause_correct",
+        "blackrock/segment/ResetCorrect/reset",
+    ]
+
+    def test_spikes_and_events_from_memory_url_match_local(self):
+        """
+        Spikes and events read from a memory:// URL match the local reads, with the NEV scanned
+        in pieces of 7 packets so that segments and units straddle many piece boundaries.
+        """
+        for entity in self.nev_entities:
+            local, remote = self._open_local_and_from_memory(entity, nev_packets_per_piece=7)
+            assert_equal(remote.header, local.header)
+            # Bounded memory: a scanned NEV keeps no spike packets (2.3 is still read whole).
+            self.assertEqual("Spikes" in remote.nev_data, remote._nev_spec == "2.3")
+            self._assert_same_spikes_and_events(local, remote)
+
+    def test_nev_only_from_memory_url_matches_local(self):
+        """A recording opened from its .nev alone gets the same segments and spikes remotely as locally."""
+        import shutil
+        import tempfile
+
+        import fsspec
+
+        for entity in [
+            "blackrock/blackrock_3_0/file_spec_3_0",
+            "blackrock/blackrock_3_0_ptp/20231027-125608-001",
+            # A 3.0 NEV with three spikes written after later ones: one segment, spikes sorted by the scan.
+            "blackrock/blackrock_ptp_with_missing_samples/Hub1-NWBtestfile_neural_wspikes",
+        ]:
+            folder = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, folder)
+            shutil.copy(self.get_local_path(entity) + ".nev", folder)
+            local_base = str(Path(folder) / Path(entity).name)
+            local = BlackrockRawIO(filename=local_base)
+            local.parse_header()
+            fs = fsspec.filesystem("memory")
+            fs.pipe(f"/nev_only/{entity}.nev", Path(self.get_local_path(entity) + ".nev").read_bytes())
+            self.addCleanup(fs.rm, f"/nev_only/{entity}.nev")
+            # A piece of 1 packet puts a piece boundary before every packet, so every
+            # timestamp jump is found only across a boundary.
+            for packets_per_piece in (1, 7):
+                remote = BlackrockRawIO(filename=f"memory:///nev_only/{entity}")
+                remote._nev_packets_per_piece = packets_per_piece
+                remote.parse_header()
+                remote._nev_packets_per_piece = 4096
+                assert_equal(remote.header, local.header)
+                self.assertEqual(remote.segment_count(0), local.segment_count(0))
+                self._assert_same_spikes_and_events(local, remote)
+
+    def test_unmatched_and_reordered_packets_from_memory_url_match_local(self):
+        """The counts of packets of no known type, and of packets read in timestamp order, are the same remotely."""
+        for entity in [
+            "blackrock/version_2_2/spikes/stim_electrode_ids_above_5120/stim_electrode_ids_above_5120",
+            "blackrock/blackrock_3_0/file_spec_3_0",
+        ]:
+            local, remote = self._open_local_and_from_memory(entity, nev_packets_per_piece=7, nsx_to_load=None)
+            self.assertGreater(len(local.nev_unmatched_packets), 0)
+            self.assertEqual(remote.nev_unmatched_packets, local.nev_unmatched_packets)
+        local, remote = self._open_local_and_from_memory(self.PTP_ENTITY, nev_packets_per_piece=7, gap_tolerance_ms=0)
+        self.assertEqual(remote.nev_reordered_packets, local.nev_reordered_packets)
+        self.assertEqual(remote.nsx_reordered_packets, local.nsx_reordered_packets)
+        self._assert_same_signals(local, remote)
+        self._assert_same_spikes_and_events(local, remote)
+
+    def _nev_with_comments(self, folder, every, ahead_ns, reset_after=None):
+        """
+        Write a FileSpec 3.0 NEV (from neo's file_spec_3_0.nev) with a comment after every `every`
+        spikes, stamped `ahead_ns` after the spike before it, so it is later than the spikes that
+        follow (a tuple of `ahead_ns` is used in turn, comment by comment). With `reset_after`, every packet after that many spikes has its clock reset to
+        near zero, as a real reset does. Returns the base name, the spikes before the reset and
+        after it, and the comments' timestamps.
+        """
+        source = Path(self.get_local_path("blackrock/blackrock_3_0/file_spec_3_0") + ".nev").read_bytes()
+        header_size, packet_size = np.frombuffer(source[12:20], dtype="<u4")
+        spike_dtype = np.dtype([("timestamp", "<u8"), ("packet_id", "<u2"), ("rest", f"S{packet_size - 10}")])
+        packets = np.frombuffer(source[header_size:], dtype=spike_dtype)
+        packets = packets[(packets["packet_id"] >= 1) & (packets["packet_id"] <= 2048)]
+        comment = np.zeros(1, dtype=[("timestamp", "<u8"), ("packet_id", "<u2"), ("rest", f"S{packet_size - 10}")])
+        comment["packet_id"] = 0xFFFF
+        comment["rest"] = b"\x00\x00\x00\x00\x00\x00note"  # char_set 0, flag 0, color 0, then the text
+
+        out, before, after, comments = [], 0, 0, []
+        aheads = np.atleast_1d(ahead_ns)
+        shift = 0
+        for i, packet in enumerate(packets):
+            if reset_after is not None and i == reset_after:
+                shift = int(packet["timestamp"]) - 1000  # the clock restarts near zero
+            spike = packet.copy()
+            spike["timestamp"] -= shift
+            out.append(np.array(spike, dtype=spike_dtype).tobytes())
+            if reset_after is None or i < reset_after:
+                before += 1
+            else:
+                after += 1
+            if (i + 1) % every == 0:
+                note = comment.copy()
+                note["timestamp"] = spike["timestamp"] + aheads[len(comments) % len(aheads)]
+                out.append(note.tobytes())
+                comments.append(int(note["timestamp"][0]))
+        base = str(Path(folder) / "rec")
+        Path(base + ".nev").write_bytes(source[:header_size] + b"".join(out))
+        return base, before, after, comments
+
+    def _open_nev_locally_and_from_memory(self, base):
+        import fsspec
+
+        local = BlackrockRawIO(filename=base)
+        local.parse_header()
+        fs = fsspec.filesystem("memory")
+        fs.pipe(f"/synthetic{base}.nev", Path(base + ".nev").read_bytes())
+        self.addCleanup(fs.rm, f"/synthetic{base}.nev")
+        remote = BlackrockRawIO(filename=f"memory:///synthetic{base}")
+        remote._nev_packets_per_piece = 7
+        remote.parse_header()
+        return local, remote
+
+    def _spikes_per_segment(self, reader):
+        return [
+            sum(len(reader.get_spike_timestamps(0, seg, u, None, None)) for u in range(reader.spike_channels_count()))
+            for seg in range(reader.segment_count(0))
+        ]
+
+    def test_comments_stamped_ahead_do_not_split_segments(self):
+        """
+        A comment timestamped a few ms later than the spikes written after it is not a clock reset:
+        only a packet earlier than the last packet of its own type is. Otherwise every such comment
+        starts a segment, and spikes outside the first one are never returned.
+        """
+        import shutil
+        import tempfile
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        base, spikes, _, comments = self._nev_with_comments(folder, every=50, ahead_ns=3_000_000)
+        self.assertGreater(len(comments), 5)
+        for reader in self._open_nev_locally_and_from_memory(base):
+            self.assertEqual(reader.segment_count(0), 1)
+            self.assertEqual(self._spikes_per_segment(reader), [spikes])
+            comment_channel = list(reader.header["event_channels"]["name"]).index("comments")
+            self.assertEqual(reader.event_count(0, 0, comment_channel), len(comments))
+
+    def test_comments_out_of_order_among_themselves_do_not_split_segments(self):
+        """
+        A comment written after one stamped later than it (each is stamped when its event starts and
+        written when its text is built) is not a clock reset either: comments never start a segment.
+        Every comment is still read, with its own timestamp.
+        """
+        import shutil
+        import tempfile
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        # At 30 kHz, comments 4 ms and 1 ms ahead in turn, one after every spike: where two spikes are
+        # closer than 3 ms, the second comment is earlier than the first.
+        base, spikes, _, comments = self._nev_with_comments(folder, every=1, ahead_ns=(120, 30))
+        self.assertTrue(np.any(np.diff(comments) < 0))
+        for reader in self._open_nev_locally_and_from_memory(base):
+            self.assertEqual(reader.segment_count(0), 1)
+            self.assertEqual(self._spikes_per_segment(reader), [spikes])
+            comment_channel = list(reader.header["event_channels"]["name"]).index("comments")
+            timestamps, _, _ = reader.get_event_timestamps(0, 0, comment_channel, None, None)
+            assert_equal(timestamps, comments)
+
+    def test_real_reset_among_comments_is_one_boundary(self):
+        """
+        A real clock reset still starts a segment, once: every packet type's clock goes back,
+        and the comments after the reset are not compared with those before it.
+        """
+        import shutil
+        import tempfile
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        base, before, after, _ = self._nev_with_comments(folder, every=50, ahead_ns=3_000_000, reset_after=400)
+        for reader in self._open_nev_locally_and_from_memory(base):
+            self.assertEqual(reader.segment_count(0), 2)
+            self.assertEqual(self._spikes_per_segment(reader), [before, after])
+
+    def test_scanned_nev_counts_spikes_without_reading_them_again(self):
+        """
+        On a scanned NEV, spike_count reads nothing (the counts come from the open-time scan), and
+        the counts equal the spikes the per-unit reads return.
+        """
+        import shutil
+        import tempfile
+
+        import fsspec
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        base, _, _, _ = self._nev_with_comments(folder, every=50, ahead_ns=3_000_000, reset_after=400)
+        entity = base.lstrip("/")
+        fs = fsspec.filesystem("memory")
+        fs.pipe(f"/once/{entity}.nev", Path(base + ".nev").read_bytes())
+        self.addCleanup(fs.rm, f"/once/{entity}.nev")
+        reader = BlackrockRawIO(filename=f"memory:///once/{entity}")
+        reader.parse_header()
+        self.assertEqual(reader.segment_count(0), 2)
+
+        passes = []
+        scan = reader._iter_nev_pieces
+
+        def counted_scan():
+            passes.append(1)
+            return scan()
+
+        reader._iter_nev_pieces = counted_scan
+        counts = [
+            reader.spike_count(0, seg, unit)
+            for seg in range(reader.segment_count(0))
+            for unit in range(reader.spike_channels_count())
+        ]
+        self.assertEqual(len(passes), 0)
+        self.assertEqual(sum(self._spikes_per_segment(reader)), sum(counts))
+
 
 if __name__ == "__main__":
     unittest.main()
