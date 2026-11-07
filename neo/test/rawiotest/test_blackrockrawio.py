@@ -690,6 +690,32 @@ class TestBlackrockRawIO(
                 assert_equal(reader._get_event_segment_ids(raw, masks, "3.0"), expected)
             self.assertEqual(reader._nb_segment_nev, max(expected) + 1)
 
+    def test_nev_packets_of_no_known_type_are_counted_and_warned_about(self):
+        """
+        A NEV data packet that matches no packet type of the file's spec is not read. It is counted by
+        packet id in nev_unmatched_packets and a warning says so, so the loss is not silent
+        (NeuralEnsemble/python-neo#1918). Trellis writes stimulation packets on 5120 plus the electrode
+        id, above 2.2's spike range, and the 3.0 test file holds packet types neo does not know.
+        """
+        cases = {
+            "blackrock/version_2_2/spikes/stim_electrode_ids_above_5120/stim_electrode_ids_above_5120": {
+                5136: 14,
+                5139: 10,
+                5176: 6,
+                5209: 2,
+            },
+            "blackrock/blackrock_3_0/file_spec_3_0": {32769: 538, 65529: 2},
+            "blackrock/FileSpec2.3001": {},
+        }
+        for path, expected in cases.items():
+            reader = BlackrockRawIO(filename=self.get_local_path(path), nsx_to_load=None)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                reader.parse_header()
+            self.assertEqual(reader.nev_unmatched_packets, expected, path)
+            warned = any("match no packet type" in str(w.message) for w in caught)
+            self.assertEqual(warned, bool(expected), path)
+
 
 if __name__ == "__main__":
     unittest.main()
