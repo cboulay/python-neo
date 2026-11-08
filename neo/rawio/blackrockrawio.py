@@ -183,6 +183,9 @@ class BlackrockRawIO(BaseRawIO):
         BaseRawIO.__init__(self)
 
         self.gap_tolerance_ms = gap_tolerance_ms
+        # NEV data packets that match no packet type for the file's spec, by packet id. They are not
+        # read, so a caller can refuse a file whose data would otherwise be lost silently.
+        self.nev_unmatched_packets = {}
 
         self.filename = str(filename)
 
@@ -1994,6 +1997,7 @@ class BlackrockRawIO(BaseRawIO):
 
             types[data_type] = data_types[data_type](packet_size_bytes)
 
+        self._count_unmatched_packets(raw_data, masks)
         event_segment_ids = self._get_event_segment_ids(raw_data, masks, spec)
 
         # Extract data for each packet type using view-then-mask pattern
@@ -2007,6 +2011,18 @@ class BlackrockRawIO(BaseRawIO):
             data[data_type] = (raw_data.view(types[data_type])[mask], event_segment_ids[mask])
 
         return data
+
+    def _count_unmatched_packets(self, raw_data, masks):
+        """Count the packets of `raw_data` that match no packet type in nev_unmatched_packets, and warn."""
+        matched = np.logical_or.reduce(list(masks.values())) if masks else np.zeros(len(raw_data), dtype=bool)
+        ids, counts = np.unique(raw_data["packet_id"][~matched], return_counts=True)
+        self.nev_unmatched_packets = dict(zip(ids.tolist(), counts.tolist()))
+        if self.nev_unmatched_packets:
+            shown = ", ".join(str(i) for i in ids[:10].tolist()) + (", ..." if len(ids) > 10 else "")
+            warnings.warn(
+                f"{int(counts.sum())} NEV data packets match no packet type of FileSpec {self._nev_spec} and "
+                f"are not read (packet ids {shown}); see nev_unmatched_packets."
+            )
 
     def _get_reset_event_mask(self, raw_event_data, masks, spec):
         """
