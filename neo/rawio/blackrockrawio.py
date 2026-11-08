@@ -2386,66 +2386,128 @@ class BlackrockRawIO(BaseRawIO):
             )
             yield start, raw
 
-    def _nev_piece_segment_ids(self, raw, masks, spec, start, state):
-        """
-        Segment ids for one piece of NEV packets, as _get_event_segment_ids gives them for the whole file.
+    @staticmethod
+    def _new_nev_segment_state():
+        return {"last": {}, "segment_start": 0, "boundaries": 0, "undocumented": [], "reordered": 0}
 
-        A segment starts at a reset comment, or at a packet whose timestamp is lower than the
-        last packet of the same type since the segment began: a clock reset sends every packet
-        type's clock back. Packets of different types are not compared, and comments are not compared at
-        all (they are not in time order among themselves either). A packet stamped earlier than the last of
-        its type by at most REORDER_WINDOW_S was written out of order, not after a reset: it is counted in
-        `state["reordered"]` and starts no segment. `state` carries the last timestamp and position of each
-        type, and the boundaries so far, from piece to piece.
+    def _iter_nev_segmented_pieces(self, spec, state):
+        """
+        Yield (index of the first packet, packets, masks, types, segment ids) over the whole NEV, a piece at
+        a time, with the segment ids _get_event_segment_ids gives the whole file. `state` carries what the
+        next piece needs, and the boundaries, late packets and undocumented resets found.
+
+        A reset is placed at the largest step back since the previous spike on the electrode that shows it,
+        which can lie in an earlier piece. So the packets from the first step back over REORDER_WINDOW_S
+        that is not resolved yet (no reset placed at or after it, and the clock not back above it) are held
+        back and read again with the next piece.
+        """
+        carry = None
+        pieces = self._iter_nev_pieces()
+        while True:
+            start, raw = next(pieces, (None, None))
+            exhausted = raw is None
+            if carry is not None:
+                start, raw = carry[0], carry[1] if exhausted else np.concatenate((carry[1], raw))
+            if raw is None:
+                return
+            masks, types = self._nev_masks_and_types(raw, spec)
+            # ponytail: a step back that never resolves would hold back the rest of the file; past 4 pieces
+            # (at least 1 M packets, about 100 MB) it is let go, which can place such a reset differently
+            # from the whole-file read.
+            final = exhausted or len(raw) >= max(4 * self._nev_packets_per_piece, 1 << 20)
+            ids, emit = self._nev_piece_segment_ids(raw, masks, spec, start, state, final)
+            if emit:
+                yield start, raw[:emit], {k: m[:emit] for k, m in masks.items()}, types, ids
+            carry = (start + emit, raw[emit:]) if emit < len(raw) else None
+            if exhausted and carry is None:
+                return
+
+    def _nev_piece_segment_ids(self, raw, masks, spec, start, state, final):
+        """
+        Segment ids for the packets of `raw` (positions from `start`) up to the first unresolved step back
+        (all of them if `final`), with the rules of _get_event_segment_ids. Returns (ids, how many).
         """
         n = len(raw)
         if spec in ["2.1", "2.2"]:
             # No pause or reset mechanism present for file version 2.1 and 2.2
-            return np.zeros(n, dtype=int)
-        reset_pos = np.flatnonzero(self._get_reset_event_mask(raw, masks, spec))
-
-        # Candidate jumps per packet type: a packet earlier than the previous one of its type.
-        # Each is kept with the position of the packet it was compared with.
-        candidates = []  # (position, position compared with, is a reset comment)
+            return np.zeros(n, dtype=int), n
+        window = REORDER_WINDOW_S * float(self._nev_basic_header["timestamp_resolution"])
+        resets = set((start + np.flatnonzero(self._get_reset_event_mask(raw, masks, spec))).tolist())
+        jumps, late, pending, kept = {}, [], [], {}
         for data_type, mask in masks.items():
-            pos = np.flatnonzero(mask)
-            if len(pos) == 0 or data_type == "Comments":
+            local = np.flatnonzero(mask)
+            if len(local) == 0 or data_type == "Comments":
                 continue
-            ts = raw["timestamp"][pos]
-            if data_type in state["last"]:
-                last_ts, last_pos = state["last"][data_type]
-                prev_ts = np.concatenate(([last_ts], ts[:-1]))
-                prev_pos = np.concatenate(([last_pos], pos[:-1] + start))
-            else:
-                prev_ts, prev_pos, ts, pos = ts[:-1], pos[:-1] + start, ts[1:], pos[1:]
-            jumps = np.flatnonzero(ts < prev_ts)
-            late = prev_ts[jumps] - ts[jumps] <= REORDER_WINDOW_S * self._nev_basic_header["timestamp_resolution"]
-            state["reordered"] += int(np.sum(late))
-            jumps = jumps[~late]
-            candidates.extend(zip((pos[jumps] + start).tolist(), prev_pos[jumps].tolist(), [False] * len(jumps)))
-            state["last"][data_type] = (raw["timestamp"][mask][-1], int(np.flatnonzero(mask)[-1]) + start)
-        candidates.extend((int(r) + start, -1, True) for r in reset_pos)
+            ts = raw["timestamp"][local].astype(np.int64)
+            keys = raw["packet_id"][local].astype(np.int64) if data_type == "Spikes" else np.zeros(len(local), int)
+            kept[data_type] = (local, ts, keys)
+            # Steps back over the window in file order, the last packet of the type already read in front.
+            file_ts, file_pos = ts, start + local.astype(np.int64)
+            if data_type in state["last"].get("type", {}):
+                last_ts, last_pos = state["last"]["type"][data_type]
+                file_ts, file_pos = np.r_[last_ts, file_ts], np.r_[last_pos, file_pos]
+            drops = np.flatnonzero(file_ts[:-1] - file_ts[1:] > window) + 1
+            recovered = np.maximum.accumulate(file_ts[::-1])[::-1]
+            pending += file_pos[drops[recovered[drops] < file_ts[drops - 1] - window]].tolist()
+            # Each packet compared with the previous one of its key (a spike: its electrode), the last
+            # ones already read in front.
+            earlier = [
+                (k, *state["last"][(data_type, k)]) for k in np.unique(keys).tolist() if (data_type, k) in state["last"]
+            ]
+            all_keys = np.concatenate(([k for k, _, _ in earlier], keys)).astype(np.int64)
+            all_ts = np.concatenate(([t for _, t, _ in earlier], ts)).astype(np.int64)
+            all_pos = np.concatenate(([q for _, _, q in earlier], start + local)).astype(np.int64)
+            order = np.argsort(all_keys, kind="stable")
+            k_s, t_s, p_s = all_keys[order], all_ts[order], all_pos[order]
+            back = np.flatnonzero((t_s[1:] < t_s[:-1]) & (k_s[1:] == k_s[:-1]))
+            is_late = t_s[back] - t_s[back + 1] <= window
+            late.append(np.stack((p_s[back + 1][is_late], p_s[back][is_late])))
+            for before, after in zip(p_s[back][~is_late].tolist(), p_s[back + 1][~is_late].tolist()):
+                inside = drops[(file_pos[drops] > before) & (file_pos[drops] <= after)]
+                at = int(file_pos[inside[np.argmax(file_ts[inside - 1] - file_ts[inside])]]) if len(inside) else after
+                jumps[at] = max(jumps.get(at, -1), before)
 
-        # Accept in file order. A jump counts only if the packet it was compared with is in the
-        # current segment, so one reset is one boundary however many packet types it sends back.
-        reset_at = {int(r) + start for r in reset_pos}
-        boundaries = []
-        for position, compared_with, is_reset in sorted(candidates):
-            if boundaries and position == boundaries[-1]:
-                continue  # a reset comment and a jump at the same packet are one boundary
-            if is_reset or compared_with >= state["segment_start"]:
+        # Accept in file order. A jump counts only if the packet it was compared with is in the current
+        # segment, so one reset is one boundary however many packet types and electrodes it sends back.
+        boundaries, segment_start = [], state["segment_start"]
+        for position in sorted(resets | jumps.keys()):
+            if position in resets or jumps[position] >= segment_start:
                 boundaries.append(position)
-                state["segment_start"] = position
-                if position not in reset_at:
-                    state["undocumented"].append(position)
-        local = np.array(sorted(boundaries), dtype=np.int64) - start
-        ids = state["boundaries"] + np.searchsorted(local, np.arange(n), side="right")
-        state["boundaries"] += len(local)
-        return ids
+                segment_start = position
+        unresolved = [d for d in pending if d > segment_start]
+        emit = n if final or not unresolved else min(unresolved) - start
+        boundaries = [b for b in boundaries if b < start + emit]
 
-    @staticmethod
-    def _new_nev_segment_state():
-        return {"last": {}, "segment_start": -1, "boundaries": 0, "undocumented": [], "reordered": 0}
+        # Late packets read now, compared with a packet of their own segment.
+        late = np.concatenate(late, axis=1) if late else np.zeros((2, 0), dtype=np.int64)
+        late = late[:, late[0] < start + emit]
+        begins = np.array(([state["segment_start"]] if state["boundaries"] else []) + boundaries, dtype=np.int64)
+        segment_begins = np.full(late.shape[1], -1, dtype=np.int64)
+        if len(begins):
+            index = np.searchsorted(begins, late[0], side="right") - 1
+            segment_begins[index >= 0] = begins[index[index >= 0]]
+        state["reordered"] += int(np.sum(late[1] >= segment_begins))
+
+        # What the next piece needs: the last packet read of each type and key.
+        for data_type, (local, ts, keys) in kept.items():
+            read = local < emit
+            if not read.any():
+                continue
+            last = int(np.flatnonzero(read)[-1])
+            state["last"].setdefault("type", {})[data_type] = (int(ts[last]), start + int(local[last]))
+            reversed_keys = keys[read][::-1]
+            unique, first = np.unique(reversed_keys, return_index=True)
+            for k, r in zip(unique.tolist(), first.tolist()):
+                at = int(read.sum()) - 1 - r
+                state["last"][(data_type, k)] = (int(ts[read][at]), start + int(local[read][at]))
+        state["undocumented"] += [b for b in boundaries if b not in resets]
+        ids = state["boundaries"] + np.searchsorted(
+            np.array(boundaries, dtype=np.int64) - start, np.arange(emit), side="right"
+        )
+        state["boundaries"] += len(boundaries)
+        if boundaries:
+            state["segment_start"] = boundaries[-1]
+        return ids, emit
 
     def _scan_nev_data(self, spec):
         """
@@ -2462,11 +2524,9 @@ class BlackrockRawIO(BaseRawIO):
         counts = {}  # (raw segment id, channel id, unit id) -> spikes
         state = self._new_nev_segment_state()
         self.nev_unmatched_packets = {}
-        for start, raw in self._iter_nev_pieces():
-            masks, types = self._nev_masks_and_types(raw, spec)
+        for start, raw, masks, types, ids in self._iter_nev_segmented_pieces(spec, state):
             self._add_unmatched_packets(raw, masks)
             kept_types = types
-            ids = self._nev_piece_segment_ids(raw, masks, spec, start, state)
             for data_type, (records, record_ids) in kept.items():
                 records.append(raw.view(types[data_type])[masks[data_type]])
                 record_ids.append(ids[masks[data_type]])
@@ -2563,9 +2623,7 @@ class BlackrockRawIO(BaseRawIO):
         ]
         records, record_ids = [], []
         state = self._new_nev_segment_state()
-        for start, raw in self._iter_nev_pieces():
-            masks, types = self._nev_masks_and_types(raw, self._nev_spec)
-            ids = self._nev_piece_segment_ids(raw, masks, self._nev_spec, start, state)
+        for start, raw, masks, types, ids in self._iter_nev_segmented_pieces(self._nev_spec, state):
             spikes = raw.view(types["Spikes"])
             positions = np.flatnonzero(
                 masks["Spikes"] & (spikes["packet_id"] == channel_id) & (spikes["unit_class_nb"] == unit_id)
